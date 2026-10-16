@@ -1,0 +1,23 @@
+## Interface: 16001
+## Title: Fletcher
+## Notes: Refills your quiver or ammo pouch with the best ammo the vendor sells, and marks it in the vendor window. Right click the vendor button or /ammo for the settings.
+## Author: Florenzi
+## Version: @project-version@
+## IconTexture: Interface\Icons\INV_Ammo_Arrow_02
+## SavedVariables: FletcherDB
+
+# Fletcher targets World of Warcraft: Forever only, whose toc is 16001.
+# Check the live value in game with
+#   /run print((select(4, GetBuildInfo())))
+# before changing the line above, and change FOREVER_INTERFACE in
+# Fletcher.lua with it.
+#
+# The settings are account-wide on purpose: the Forever client writes a
+# per-character SavedVariables file but never loads it back.
+#
+# There is no X-Curse-Project-ID yet; it is added once the CurseForge
+# project exists, and the release workflow then publishes there too.
+
+Fletcher.lua
+Fletcher_Vendor.lua
+Fletcher_Options.lua

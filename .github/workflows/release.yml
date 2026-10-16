@@ -1,0 +1,34 @@
+name: Release
+
+# Push a tag like v1.0.0 to release. The tag becomes the toc version, and a tag
+# containing "alpha" or "beta" is uploaded as that release type.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # lets the packager create the GitHub release
+    env:
+      # Without CF_API_TOKEN or the toc's X-Curse-Project-ID the packager skips
+      # CurseForge and only makes the GitHub release.
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      # packager@v2 does not read GH_API_TOKEN yet; both versions read this.
+      GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the changelog is built from the commit history
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - run: npm ci
+      - run: npm test
+
+      # Interface 16001 is uploaded to CurseForge's Forever flavor as 1.60.1.
+      - uses: BigWigsMods/packager@v2

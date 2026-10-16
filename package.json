@@ -1,0 +1,13 @@
+{
+  "name": "fletcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless test harness for the Fletcher WoW addon.",
+  "scripts": {
+    "test": "node tests/run.js",
+    "deploy": "node scripts/deploy.mjs"
+  },
+  "devDependencies": {
+    "fengari": "^0.1.5"
+  }
+}

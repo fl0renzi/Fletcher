@@ -1,0 +1,19 @@
+package-as: Fletcher
+
+# The release notes are written by hand for players and sent to CurseForge as
+# the file's changelog. Like the readme, they stay out of the zip: an ignored
+# changelog is read from the repo instead of the package.
+manual-changelog:
+  filename: CHANGELOG.md
+  markup-type: markdown
+
+# No libraries are embedded, so there are no externals. Dotfiles (.github,
+# .gitignore, ...) are left out by default.
+ignore:
+  - README.md
+  - CHANGELOG.md
+  - tests
+  - scripts
+  - package.json
+  - package-lock.json
+  - dist
