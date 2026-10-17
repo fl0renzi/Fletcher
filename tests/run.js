@@ -29,18 +29,19 @@ function run(file) {
   }
 }
 
-// The addon's files must be plain ASCII.
-for (const file of ["Fletcher.lua", "Fletcher_Vendor.lua", "Fletcher_Options.lua", "Fletcher.toc"]) {
-  const text = fs.readFileSync(path.join(root, file), "utf8");
-  const line = text.split(/\r?\n/).findIndex((entry) => /[^\x00-\x7F]/.test(entry));
-  if (line !== -1) fail(file, "non-ASCII character on line " + (line + 1));
-}
-
 // The load order is the .toc's, so a file missing from it fails here too.
 const tocFiles = fs.readFileSync(path.join(root, "Fletcher.toc"), "utf8")
   .split(/\r?\n/)
   .map((line) => line.trim())
   .filter((line) => line.length > 0 && !line.startsWith("#"));
+
+// The addon's files must be plain ASCII: multi-byte punctuation corrupts in
+// the packaging pipeline.
+for (const file of ["Fletcher.toc", ...tocFiles]) {
+  const text = fs.readFileSync(path.join(root, ...file.split("\\")), "utf8");
+  const line = text.split(/\r?\n/).findIndex((entry) => /[^\x00-\x7F]/.test(entry));
+  if (line !== -1) fail(file, "non-ASCII character on line " + (line + 1));
+}
 
 run("tests/wow_stub.lua");
 

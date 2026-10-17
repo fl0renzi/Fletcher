@@ -15,8 +15,9 @@
 # The settings are account-wide on purpose: the Forever client writes a
 # per-character SavedVariables file but never loads it back.
 #
-# There is no X-Curse-Project-ID yet; it is added once the CurseForge
-# project exists, and the release workflow then publishes there too.
+# VERIFY in game that the icon above loads; if it does not, use
+# Interface\Icons\INV_Misc_Ammo_Arrow_01 here and as DEFAULT_ICON in
+# Fletcher.lua.
 
 Fletcher.lua
 Fletcher_Vendor.lua

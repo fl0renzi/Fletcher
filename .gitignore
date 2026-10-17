@@ -1,6 +1,3 @@
-node_modules/
-dist/
-
 # AI tooling and agent config (workflows are tracked)
 .github/skills/
 .github/instructions/
@@ -8,6 +5,12 @@ AGENTS.md
 
 # Local planning notes, kept out of the repo on purpose
 fletcher_addon_plan.md
+
+# Test harness dependencies
+node_modules/
+
+# Release output
+dist/
 
 # Local deploy target for scripts/deploy.mjs (machine specific)
 deploy.local.json

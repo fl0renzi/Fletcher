@@ -15,6 +15,11 @@
 // E:\World of Warcraft\_classic_beta_\Interface\AddOns\Fletcher. It comes
 // from --to, from the FLETCHER_ADDONS environment variable, or from the
 // gitignored deploy.local.json next to this repo as {"addonsPath": "..."}.
+//
+// A --local install stamps the toc's @project-version@ as v<version>-dev,
+// the version at the top of CHANGELOG.md, so the menu and the settings page
+// show which build is in, and it always installs: the working tree changes
+// without its version changing.
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -26,6 +31,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPO = "fl0renzi/Fletcher";
 const ADDON = "Fletcher"; // the folder name inside AddOns, and in the zip
 const TOC = "Fletcher.toc";
+const PLACEHOLDER = "@project-version@";
 
 function fail(message) {
   console.error("deploy: " + message);
@@ -104,8 +110,7 @@ if (existsSync(target)) {
 
 // --- where it comes from ---------------------------------------------------
 
-// The files the addon ships, read from the .toc the same way the release
-// packager reads it: the .toc itself and every file it lists.
+// The files the release zip holds: the .toc and the files it lists.
 function shippedFiles() {
   const toc = readFileSync(join(root, TOC), "utf8");
   const lua = toc
@@ -126,6 +131,13 @@ function listFiles(folder) {
   };
   walk(folder);
   return files;
+}
+
+// The version at the top of CHANGELOG.md, the one being worked on.
+function changelogVersion() {
+  const file = join(root, "CHANGELOG.md");
+  const match = existsSync(file) && readFileSync(file, "utf8").match(/^##\s*(\d+\.\d+\.\d+)\s*$/m);
+  return match ? match[1] : "0.0.0";
 }
 
 const work = join(tmpdir(), "fletcher-deploy-" + process.pid);
@@ -156,9 +168,7 @@ async function fromRelease() {
   rmSync(extractDir, { recursive: true, force: true });
   mkdirSync(extractDir, { recursive: true });
   if (process.platform === "win32") {
-    // The .NET zip API, as the release packager uses it: Compress-Archive's
-    // module does not always autoload, and Expand-Archive has the same
-    // problem.
+    // The .NET zip API: Expand-Archive's module does not always autoload.
     execFileSync("powershell", ["-NoProfile", "-Command",
       "Add-Type -AssemblyName System.IO.Compression.FileSystem;" +
       `[System.IO.Compression.ZipFile]::ExtractToDirectory('${zipPath}','${extractDir}')`,
@@ -170,11 +180,11 @@ async function fromRelease() {
   const source = join(extractDir, ADDON);
   if (!existsSync(join(source, TOC))) fail("the release zip did not contain " + ADDON + "/" + TOC);
 
-  return { folder: source, description: "release " + (release.tag_name || "?"), version: (release.tag_name || "").replace(/^v/, "") };
+  return { folder: source, description: "release " + (release.tag_name || "?"), version: release.tag_name || "?" };
 }
 
 function fromWorkingTree() {
-  return { folder: root, description: "working tree", version: versionIn(root) || "0.0.0" };
+  return { folder: root, description: "working tree", version: "v" + changelogVersion() + "-dev" };
 }
 
 // --- install ---------------------------------------------------------------
@@ -189,13 +199,13 @@ try {
 console.log(`deploy: installed ${installed || "(nothing)"}; ${source.description} is ${source.version}`);
 
 if (options.check) {
-  if (installed && installed === source.version) console.log("deploy: up to date");
+  if (installed && installed === source.version && !options.local) console.log("deploy: up to date");
   else console.log(`deploy: would install ${source.version} into ${target}`);
   rmSync(work, { recursive: true, force: true });
   process.exit(0);
 }
 
-if (installed && installed === source.version && !options.force) {
+if (!options.local && installed && installed === source.version && !options.force) {
   console.log("deploy: already at " + installed + "; nothing to do (--force reinstalls)");
   rmSync(work, { recursive: true, force: true });
   process.exit(0);
@@ -220,7 +230,13 @@ for (const file of files) {
   cpSync(file.from, file.to);
 }
 
+// The working tree's toc still holds the packager's placeholder.
+if (options.local) {
+  const toc = join(target, TOC);
+  writeFileSync(toc, readFileSync(toc, "utf8").replace(PLACEHOLDER, source.version));
+}
+
 rmSync(work, { recursive: true, force: true });
 
 console.log(`deploy: ${files.length} files written to ${target}`);
-console.log("deploy: the client picks the new version up on the next /reload or restart");
+console.log("deploy: a new addon or a changed toc file list needs a game restart; otherwise /reload picks it up");

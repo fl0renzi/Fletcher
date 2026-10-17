@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v1.0.0 to release. The tag becomes the toc version, and a tag
+# Push a tag like v1.0.1 to release. The tag becomes the toc version, and a tag
 # containing "alpha" or "beta" is uploaded as that release type.
 on:
   push:

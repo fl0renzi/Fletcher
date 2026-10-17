@@ -4,6 +4,7 @@
 -- addon's own logic, not Blizzard's. Anything game-side a test needs to
 -- control lives behind a __ helper below. A widget method the addon calls that
 -- is not defined here fails the test, the way a misspelled one fails in game.
+-- The widget, menu, template and settings parts are BeastXP's.
 
 -- Lua 5.1 compatibility the addon relies on.
 unpack = unpack or table.unpack
@@ -21,10 +22,11 @@ local secretMeta = {
     __le = function() error("attempt to compare a secret value") end,
     __add = function() error("attempt to perform arithmetic on a secret value") end,
     __sub = function() error("attempt to perform arithmetic on a secret value") end,
-    __div = function() error("attempt to perform arithmetic on a secret value") end,
     __mul = function() error("attempt to perform arithmetic on a secret value") end,
+    __div = function() error("attempt to perform arithmetic on a secret value") end,
     __concat = function() error("attempt to concatenate a secret value") end,
     __len = function() error("attempt to get length of a secret value") end,
+    __index = function() error("attempt to index a secret value") end,
 }
 
 function __secret()
@@ -37,11 +39,19 @@ function issecretvalue(value)
     return secretRegistry[value] == true
 end
 
+-- A value the stub itself can do sums with: a secret counts as nothing.
+local function plain(value, default)
+    if issecretvalue(value) then return default end
+    if value == nil then return default end
+    return value
+end
+
 --------------------------------------------------------------------------------
 -- Output
 --------------------------------------------------------------------------------
 
-__print = print
+local real_print = print
+__print = real_print
 __output = {}
 
 function print(...)
@@ -59,20 +69,24 @@ function __printed(fragment)
     return false
 end
 
+-- How many printed lines contain the fragment.
+function __printed_count(fragment)
+    local count = 0
+    for _, line in ipairs(__output) do
+        if line:find(fragment, 1, true) then count = count + 1 end
+    end
+    return count
+end
+
 function strtrim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 --------------------------------------------------------------------------------
--- Game state the tests drive
+-- Timers
 --------------------------------------------------------------------------------
 
--- Forever reports 16001. A test changes it to exercise the gate.
-__interface = 16001
-function GetBuildInfo() return "1.60.1", "69893", "Sep 18 2026", __interface end
-
--- C_Timer on a clock the tests move with __advance. A ticker runs its
--- callback every interval until cancelled, or for its number of iterations.
+-- C_Timer on a clock the tests move with __advance.
 __now = 0
 local timers = {}
 
@@ -83,11 +97,6 @@ local function schedule(delay, callback, iterations)
     timers[#timers + 1] = timer
     return timer
 end
-
-C_Timer = {
-    After = function(delay, callback) schedule(delay, callback, 1) end,
-    NewTicker = function(interval, callback, iterations) return schedule(interval, callback, iterations) end,
-}
 
 function __advance(seconds)
     local target = __now + seconds
@@ -110,7 +119,6 @@ function __advance(seconds)
     __now = target
 end
 
--- The timers still waiting to run.
 function __pending_timers()
     local count = 0
     for _, timer in ipairs(timers) do
@@ -119,13 +127,86 @@ function __pending_timers()
     return count
 end
 
-function __reset_timers()
+local function resetTimers()
     timers = {}
     __now = 0
 end
 
--- The toc's Version line. The repository's toc holds the packager's
--- placeholder; a test names a release to see it shown.
+--------------------------------------------------------------------------------
+-- Items
+--------------------------------------------------------------------------------
+-- The 1.x vendor ammo and a few items around it. A test changes __items[id]
+-- for one session: cached = false leaves it out of the client's cache, and
+-- any field may be a secret.
+
+local ITEMS = {
+    -- Arrows: class 6 (Projectile), subclass 2.
+    [2512]  = { name = "Rough Arrow", class = 6, subclass = 2, itemLevel = 5, minLevel = 1, stack = 200 },
+    [2515]  = { name = "Sharp Arrow", class = 6, subclass = 2, itemLevel = 15, minLevel = 10, stack = 200 },
+    [3030]  = { name = "Razor Arrow", class = 6, subclass = 2, itemLevel = 30, minLevel = 25, stack = 200 },
+    [11285] = { name = "Jagged Arrow", class = 6, subclass = 2, itemLevel = 45, minLevel = 40, stack = 200 },
+    [18042] = { name = "Thorium Headed Arrow", class = 6, subclass = 2, itemLevel = 57, minLevel = 52, stack = 200 },
+    -- Bullets: subclass 3.
+    [2516]  = { name = "Light Shot", class = 6, subclass = 3, itemLevel = 5, minLevel = 1, stack = 200 },
+    [2519]  = { name = "Heavy Shot", class = 6, subclass = 3, itemLevel = 15, minLevel = 10, stack = 200 },
+    [3033]  = { name = "Solid Shot", class = 6, subclass = 3, itemLevel = 30, minLevel = 25, stack = 200 },
+    [11284] = { name = "Accurate Slugs", class = 6, subclass = 3, itemLevel = 45, minLevel = 40, stack = 200 },
+    [15997] = { name = "Thorium Shells", class = 6, subclass = 3, itemLevel = 57, minLevel = 52, stack = 200 },
+    -- Bags: class 11 (Quiver), subclass 2 quiver or 3 ammo pouch; class 1 a bag.
+    [2101]  = { name = "Light Quiver", class = 11, subclass = 2, family = 1, stack = 1 },
+    [2102]  = { name = "Small Ammo Pouch", class = 11, subclass = 3, family = 2, stack = 1 },
+    [4496]  = { name = "Small Brown Pouch", class = 1, subclass = 0, family = 0, stack = 1 },
+    -- Ranged weapons: class 2, subclass 2 bow, 3 gun, 18 crossbow, 16 thrown.
+    [2504]  = { name = "Worn Shortbow", class = 2, subclass = 2, stack = 1 },
+    [2508]  = { name = "Old Blunderbuss", class = 2, subclass = 3, stack = 1 },
+    [15808] = { name = "Fine Light Crossbow", class = 2, subclass = 18, stack = 1 },
+    [2947]  = { name = "Small Throwing Knife", class = 2, subclass = 16, stack = 200 },
+    -- What else a vendor sells.
+    [159]   = { name = "Refreshing Spring Water", class = 0, subclass = 0, itemLevel = 5, minLevel = 1, stack = 20 },
+}
+
+local function copyItems()
+    local items = {}
+    for id, item in pairs(ITEMS) do
+        local copy = { cached = true, icon = 130000 + id }
+        for key, value in pairs(item) do copy[key] = value end
+        items[id] = copy
+    end
+    return items
+end
+
+__items = copyItems()
+
+local function item(id)
+    if issecretvalue(id) then return nil end
+    return __items[id]
+end
+
+C_Item = {
+    GetItemInfo = function(id)
+        local entry = item(id)
+        if not entry or not entry.cached then return end
+        return entry.name, "|Hitem:" .. tostring(id) .. "|h", 1, entry.itemLevel or 1, entry.minLevel or 0,
+            "Type", "Subtype", entry.stack or 1, "", entry.icon, 0, entry.class, entry.subclass
+    end,
+    GetItemInfoInstant = function(id)
+        local entry = item(id)
+        if not entry then return end
+        return id, "Type", "Subtype", "", entry.icon, entry.class, entry.subclass
+    end,
+    GetItemCount = function(id)
+        if __itemCountSecret then return __secret() end
+        return __count(id)
+    end,
+}
+
+--------------------------------------------------------------------------------
+-- The character
+--------------------------------------------------------------------------------
+
+__interface = 16001
+function GetBuildInfo() return "1.60.1", "70450", "Oct 16 2026", __interface end
+
 __version = "@project-version@"
 C_AddOns = {
     GetAddOnMetadata = function(name, field)
@@ -141,300 +222,277 @@ end
 __level = 30
 function UnitLevel(unit)
     if unit == "player" then return __level end
+    return 0
 end
 
--- Copper on the player.
 __money = 0
 function GetMoney() return __money end
 
-function IsShiftKeyDown() return __shift == true end
+-- The ranged weapon and the ammo in the ammo slot, by item id.
+__ranged = nil
+__ammo = nil
 
-function InCombatLockdown() return __inCombat == true end
+-- The bags, by bag number: 0 is the backpack, 1 to 4 the equipped bags. A bag
+-- is { item = id, slots = n, contents = { [slot] = { id, count, locked } } }.
+__bags = {}
 
---------------------------------------------------------------------------------
--- Items, bags, the vendor
---------------------------------------------------------------------------------
--- __items      item id -> the item's own table: name, class, subclass,
---              iLevel, reqLevel, stack, icon, and true uncached while the
---              details have not arrived from the client's cache.
--- __bags       bag 1..4 -> { slots = n, family = bits or nil, and by slot
---              number { id, count, locked } }. family 0x1 holds arrows,
---              0x2 bullets.
--- __inv        bag 1..4 -> the item id of the bag in its inventory slot.
--- __ammo       the bowstring-side slot 0: { id, count } or nil when empty.
--- __ranged     the ranged weapon's slot 18: { id } or nil when empty.
--- __merchant   1..n vendor entries: { id, price (per round), usable (nil is
---              usable), stock (-1 on the stub means unlimited, nil means the
---              vendor does not count), quantity (rounds the line carries),
---              maxStack (rounds one purchase may ask for, falling back to
---              the item's stack) }.
--- __buy_log    one entry per BuyMerchantItem: { index, count, cost }.
-
--- A vendor window of six slots per page, the easy paging number. VERIFY
--- (phase0): the real MERCHANT_ITEMS_PER_PAGE the client has; the test names
--- pages through __goto_page and the stub draws __merchant onto the page.
-MERCHANT_ITEMS_PER_PAGE = 6
-
--- The icon a fixture without one gets. The addon never reads what an icon
--- says, only that it is a string.
-local FALLBACK_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
-
-local function iconOf(item)
-    return type(item) == "table" and item.icon or FALLBACK_ICON
+local function bagFamily(bag)
+    local entry = bag.item and item(bag.item)
+    return entry and plain(entry.family, 0) or 0
 end
 
-function GetItemInfo(itemID)
-    local item = __items[itemID]
-    if not item or item.uncached then return nil end
-    return item.name or ("item " .. tostring(itemID)), iconOf(item),
-        item.quality or 1, item.iLevel or 0, item.reqLevel or 0,
-        item.class, item.subclass, item.stack or 1
+-- What family of special bag an item goes into: 1 arrows, 2 bullets, 0 none.
+local function itemFamily(id)
+    local entry = item(id)
+    if entry and entry.class == 6 then return entry.subclass == 2 and 1 or 2 end
+    return 0
 end
 
--- The instant form: id, type, subtype, equipLoc, icon, classID, subClassID,
--- as both the global and the C_Item copy answer. An id the client has never
--- heard of returns nothing, as the game does.
-function GetItemInfoInstant(itemID)
-    local item = __items[itemID]
-    if not item then return nil end
-    return itemID, "item", "Inventory", "", iconOf(item), item.class, item.subclass
+-- How many of an item the bags hold.
+function __count(id)
+    local total = 0
+    for bag = 0, 4 do
+        local container = __bags[bag]
+        for _, slot in pairs(container and container.contents or {}) do
+            if plain(slot.id) == id then total = total + plain(slot.count, 0) end
+        end
+    end
+    return total
 end
 
-C_Item = {
-    GetItemInfo = GetItemInfo,
-    GetItemInfoInstant = GetItemInfoInstant,
+-- The rounds in one bag, by item id.
+function __bag_count(bag, id)
+    local total = 0
+    for _, slot in pairs(__bags[bag] and __bags[bag].contents or {}) do
+        if id == nil or plain(slot.id) == id then total = total + plain(slot.count, 0) end
+    end
+    return total
+end
+
+-- Puts rounds in the bags the way Forever was seen to on 2026-10-17: in
+-- stacks, each going onto a stack of the same item only when it fits there
+-- whole, and otherwise into an empty slot, special bags that take the item
+-- ahead of plain ones. A bought 200 did not go onto a stack of 90 in the
+-- quiver; it went to a normal bag. What does not fit at all is lost.
+-- Returns what fitted.
+function __add_item(id, count)
+    local entry = item(id)
+    local stack = entry and entry.stack or 1
+    local family = itemFamily(id)
+    local order = {}
+    for bag = 1, 4 do
+        if __bags[bag] and family ~= 0 and bagFamily(__bags[bag]) == family then order[#order + 1] = bag end
+    end
+    for bag = 0, 4 do
+        if __bags[bag] and bagFamily(__bags[bag]) == 0 then order[#order + 1] = bag end
+    end
+
+    local function place(piece)
+        for _, bag in ipairs(order) do
+            for slot = 1, __bags[bag].slots do
+                local content = __bags[bag].contents[slot]
+                if content and content.id == id and content.count + piece <= stack then
+                    content.count = content.count + piece
+                    return true
+                end
+            end
+        end
+        for _, bag in ipairs(order) do
+            for slot = 1, __bags[bag].slots do
+                if not __bags[bag].contents[slot] then
+                    __bags[bag].contents[slot] = { id = id, count = piece }
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local left, fitted = count, 0
+    while left > 0 do
+        local piece = math.min(left, stack)
+        if place(piece) then fitted = fitted + piece end
+        left = left - piece
+    end
+    return fitted
+end
+
+NUM_BAG_SLOTS = 4
+
+C_Container = {
+    ContainerIDToInventoryID = function(bag)
+        if bag >= 1 and bag <= 4 then return 19 + bag end
+    end,
+    GetContainerNumSlots = function(bag)
+        local container = __bags[bag]
+        return container and container.slots or 0
+    end,
+    GetContainerItemInfo = function(bag, slot)
+        local container = __bags[bag]
+        local content = container and container.contents[slot]
+        if not content then return nil end
+        local entry = item(content.id)
+        return {
+            itemID = content.id,
+            stackCount = content.count,
+            isLocked = content.locked or false,
+            iconFileID = entry and entry.icon or 0,
+            itemName = entry and entry.name or "",
+            hyperlink = "",
+        }
+    end,
+    GetContainerNumFreeSlots = function(bag)
+        local container = __bags[bag]
+        if not container then return 0, nil end
+        local free = 0
+        for slot = 1, container.slots do
+            if not container.contents[slot] then free = free + 1 end
+        end
+        if container.secretFamily then return free, __secret() end
+        return free, bagFamily(container)
+    end,
 }
 
--- The equipped bags sit in inventory slots; the stub numbers slot 100 + bag
--- VERIFY(phase0): the stub's number is its own; the addon never reads it.
 function GetInventoryItemID(unit, slot)
-    if unit ~= "player" or type(slot) ~= "number" then return nil end
-    if slot == 0 then return __ammo and __ammo.id or nil end
-    if slot == 18 then return __ranged and __ranged.id or nil end
-    for bag = 1, 4 do
-        if 100 + bag == slot then return __inv[bag] or nil end
+    if unit ~= "player" then return nil end
+    if slot == 0 then return __ammo end
+    if slot == 18 then return __ranged end
+    if slot >= 20 and slot <= 23 then
+        local container = __bags[slot - 19]
+        return container and container.item
     end
-    return nil
 end
 
 function GetInventoryItemCount(unit, slot)
-    if unit ~= "player" or type(slot) ~= "number" then return 0 end
-    if slot == 0 then return __ammo and __ammo.count or 0 end
-    return 1
+    if unit == "player" and slot == 0 and __ammo then return __count(__ammo) end
+    return 0
 end
 
-function ContainerIDToInventoryID(bag)
-    if type(bag) ~= "number" then return nil end
-    return 100 + bag
+function UnitUsesAmmo(unit)
+    local entry = unit == "player" and __ranged and item(__ranged)
+    if not entry then return false end
+    return entry.class == 2 and (entry.subclass == 2 or entry.subclass == 3 or entry.subclass == 18)
 end
 
-function GetContainerNumSlots(bag)
-    local bagState = __bags[bag]
-    return bagState and bagState.slots or 0
+--------------------------------------------------------------------------------
+-- The vendor
+--------------------------------------------------------------------------------
+-- __merchant is the vendor's list as the window shows it (after its filter):
+-- { id, price, batch, stock, usable, purchasable, extended, maxStack }, the
+-- batch defaulting to the item's stack, the stock to -1 (unlimited). A
+-- purchase is logged in __buy_log and lands when a test calls __deliver,
+-- which charges the money, fills the bags and fires BAG_UPDATE_DELAYED.
+
+__merchant = {}
+__buy_log = {}
+__buyback = 2
+local deliveries = {}
+
+local function merchantEntry(index)
+    return __merchant[index]
 end
 
-function GetContainerNumFreeSlots(bag)
-    local bagState = __bags[bag]
-    if not bagState then return 0, nil end
-    local free = 0
-    for slot = 1, bagState.slots do
-        local held = bagState[slot]
-        if not (held and held.id) then free = free + 1 end
-    end
-    return free, bagState.family
+local function batchOf(entry)
+    if entry.batch then return entry.batch end
+    local info = item(entry.id)
+    return info and info.stack or 1
 end
 
-function GetContainerItemID(bag, slot)
-    local held = __bags[bag] and __bags[bag][slot]
-    return held and held.id or nil
-end
-
--- The old list form: icon, count, locked, ...
-function GetContainerItemInfo(bag, slot)
-    local held = __bags[bag] and __bags[bag][slot]
-    if not (held and held.id) then return nil end
-    local item = __items[held.id]
-    return iconOf(item), held.count, held.locked and true or false
-end
-
--- The C form: an info table, as retail 12.0 answers, or nothing for an empty
--- slot.
-C_Container = {
-    GetContainerItemInfo = function(bag, slot)
-        local held = __bags[bag] and __bags[bag][slot]
-        if not (held and held.id) then return nil end
-        local item = __items[held.id]
-        return {
-            itemID = held.id,
-            iconFileID = iconOf(item),
-            stackCount = held.count,
-            isLocked = held.locked and true or false,
-        }
-    end,
-    GetContainerItemID = GetContainerItemID,
-    GetContainerNumSlots = GetContainerNumSlots,
-    GetContainerNumFreeSlots = GetContainerNumFreeSlots,
-    ContainerIDToInventoryID = ContainerIDToInventoryID,
-}
-
-function GetMerchantNumItems() return #__merchant end
-function GetMerchantItemID(index)
-    local entry = __merchant[index]
-    return entry and entry.id or nil
-end
-
--- The old list form: name, icon, price, quantity in the line, numAvailable,
--- isUsable.
-function GetMerchantItemInfo(index)
-    local entry = __merchant[index]
-    if not entry then return nil end
-    local item = __items[entry.id]
-    return item.name, iconOf(item), entry.price,
-        entry.quantity or 1,
-        entry.stock == nil and -1 or entry.stock,
-        entry.usable ~= false
-end
-
--- The C form: an info table, as retail 12.0 answers, with the same numbers.
 C_MerchantFrame = {
     GetItemInfo = function(index)
-        local entry = __merchant[index]
+        local entry = merchantEntry(index)
         if not entry then return nil end
-        local item = __items[entry.id]
+        if entry.secretInfo then
+            return { name = __secret(), texture = __secret(), price = __secret(), stackCount = __secret(),
+                numAvailable = __secret(), isPurchasable = __secret(), isUsable = __secret(),
+                hasExtendedCost = __secret() }
+        end
+        local info = item(entry.id)
         return {
-            name = item.name,
-            icon = iconOf(item),
-            price = entry.price,
-            quantity = entry.quantity or 1,
-            numAvailable = entry.stock == nil and -1 or entry.stock,
+            name = info and info.name,
+            texture = info and info.icon or 0,
+            price = entry.price or 0,
+            stackCount = batchOf(entry),
+            numAvailable = entry.stock or -1,
+            isPurchasable = entry.purchasable ~= false,
             isUsable = entry.usable ~= false,
+            hasExtendedCost = entry.extended == true,
+            isQuestStartItem = false,
         }
     end,
-    GetNumItems = GetMerchantNumItems,
 }
 
--- The most rounds one purchase may ask.
+function GetMerchantNumItems()
+    if __merchantCountSecret then return __secret() end
+    return #__merchant
+end
+
+function GetMerchantItemID(index)
+    local entry = merchantEntry(index)
+    return entry and entry.id
+end
+
 function GetMerchantItemMaxStack(index)
-    local entry = __merchant[index]
-    if not entry then return nil end
-    return entry.maxStack or (__items[entry.id] and __items[entry.id].stack) or 1
+    local entry = merchantEntry(index)
+    if not entry then return 0 end
+    if entry.maxStack then return entry.maxStack end
+    local info = item(entry.id)
+    return info and info.stack or 1
 end
 
--- One purchase: the stub's model matches the plan's assumption until the
--- Phase 0 probe answers, so count is rounds, entry.price is per round, one
--- call delivers the rounds. The rounds land in the ammo bags whose family
--- takes the ammo's kind, topping stacks up first and then filling empty
--- slots, as a bag update would. It never fires the game's own events: the
--- test fires them, seeing each step of the queue.
-__buy_log = {}
+function BuyMerchantItem(index, quantity)
+    local entry = merchantEntry(index)
+    __buy_log[#__buy_log + 1] = { index = index, id = entry and entry.id, quantity = quantity }
+    if not entry or __refuse then return end
+    deliveries[#deliveries + 1] = { id = entry.id, quantity = quantity or batchOf(entry),
+        price = entry.price or 0, batch = batchOf(entry) }
+end
 
-function BuyMerchantItem(index, count)
-    local entry = __merchant[index]
-    if not entry then
-        error("BuyMerchantItem: no merchant item " .. tostring(index))
+-- The rounds asked for so far, in all.
+function __bought()
+    local total = 0
+    for _, purchase in ipairs(__buy_log) do total = total + purchase.quantity end
+    return total
+end
+
+-- Lands every purchase made so far, then fires BAG_UPDATE_DELAYED, which may
+-- make the addon buy again. Returns how many landed.
+function __deliver()
+    local list = deliveries
+    deliveries = {}
+    for _, purchase in ipairs(list) do
+        -- Seen in game on 2026-10-17: 50 of a 200 batch for 9c took 3c.
+        __money = __money - math.ceil(purchase.quantity * purchase.price / purchase.batch)
+        __add_item(purchase.id, purchase.quantity)
     end
-    local item = __items[entry.id]
-    local rounds = entry.quantity or 1
-    local cost = math.floor((entry.price / rounds) * count + 0.5)
-    __money = __money - cost
-    __buy_log[#__buy_log + 1] = { index = index, count = count, cost = cost }
+    __fire("PLAYER_MONEY")
+    __fire("BAG_UPDATE_DELAYED")
+    return #list
+end
 
-    local stock = entry.stock
-    if type(stock) == "number" and stock >= 0 then
-        entry.stock = math.max(0, stock - count)
+-- Lands purchases until the addon stops buying.
+function __deliver_all()
+    for _ = 1, 50 do
+        if #deliveries == 0 then return end
+        __deliver()
     end
-
-    local family
-    if item.class == 6 then
-        if item.subclass == 2 then family = 0x1
-        elseif item.subclass == 3 then family = 0x2
-        end
-    end
-    local left = count
-    local stack = item.stack or 1
-    for bag = 1, 4 do
-        local bagState = __bags[bag]
-        local takes
-        if bagState and family then
-            takes = math.floor(bagState.family / family) % 2 == 1
-        end
-        if takes and left > 0 then
-            for slot = 1, bagState.slots do
-                local held = bagState[slot]
-                if held and held.id == entry.id and not held.locked and held.count < stack then
-                    local add = math.min(stack - held.count, left)
-                    held.count = held.count + add
-                    left = left - add
-                end
-            end
-            for slot = 1, bagState.slots do
-                if left <= 0 then break end
-                local held = bagState[slot]
-                if not (held and held.id) and not (held and held.locked) then
-                    local add = math.min(stack, left)
-                    bagState[slot] = { id = entry.id, count = add }
-                    left = left - add
-                end
-            end
-        end
-    end
-    return true
+    error("the addon never stopped buying")
 end
 
-function MerchantFrame_UpdateMerchantInfo()
-    local page = __merchant_page
-    MerchantFrame.page = page
-    for n = 1, MERCHANT_ITEMS_PER_PAGE do
-        local index = (page - 1) * MERCHANT_ITEMS_PER_PAGE + n
-        local holder = _G["MerchantItem" .. n]
-        if holder then
-            if __merchant[index] then holder:Show() else holder:Hide() end
-        end
-    end
-end
-
-function MerchantFrame_Update() MerchantFrame_UpdateMerchantInfo() end
-
--- Opens a vendor the way the game does: MERCHANT_SHOW, then Blizzard draws
--- the first page.
-function __open_vendor(merchant)
-    __merchant = merchant or {}
-    __merchant_page = 1
-    __fire("MERCHANT_SHOW")
-    MerchantFrame_Update()
-end
-
-function __close_vendor()
-    __fire("MERCHANT_CLOSED")
-    __merchant = {}
-end
-
--- Flips a vendor page, as the game's arrows would: Blizzard redraws, then
--- the stock-changed event reaches anyone listening.
-function __goto_page(page)
-    __merchant_page = page
-    MerchantFrame_Update()
-    __fire("MERCHANT_UPDATE")
-end
-
--- The highlight's overlays, by item slot, where the test expects them.
-function __overlays()
-    local list = {}
-    for n = 1, MERCHANT_ITEMS_PER_PAGE do
-        list[n] = _G["FletcherOverlay" .. n]
-    end
-    return list
-end
+function __pending_purchases() return #deliveries end
 
 --------------------------------------------------------------------------------
 -- Widgets
 --------------------------------------------------------------------------------
 
--- Texture files the client cannot load: setting one returns false.
 __badTextures = {}
 
 local methods = {}
 local frames = {}
+
+local function fontOf(object)
+    return object and object.__font
+end
 
 function methods:SetPoint(...) self.__points[#self.__points + 1] = { ... } end
 function methods:ClearAllPoints() self.__points = {} end
@@ -470,11 +528,18 @@ function methods:GetScript(name) return self.__scripts[name] end
 function methods:SetFrameStrata(strata) self.__strata = strata end
 function methods:SetFrameLevel(level) self.__frameLevel = level end
 function methods:GetFrameLevel() return self.__frameLevel or 1 end
-
+function methods:EnableMouse(enabled) self.__mouse = enabled end
+function methods:SetAlpha(alpha) self.__alpha = alpha end
+function methods:GetAlpha() return self.__alpha or 1 end
+function methods:SetID(id) self.__id = id end
+function methods:GetID() return self.__id or 0 end
 function methods:CreateTexture() return __new_widget("Texture", self) end
 function methods:CreateFontString(_, _, template)
     local fontString = __new_widget("FontString", self)
-    if template then fontString:SetFontObject(_G[template]) end
+    if template then
+        if not _G[template] then error("CreateFontString: unknown font object " .. tostring(template)) end
+        fontString:SetFontObject(_G[template])
+    end
     return fontString
 end
 function methods:RegisterEvent(event)
@@ -483,62 +548,50 @@ function methods:RegisterEvent(event)
     end
     self.__events[event] = true
 end
-function methods:UnregisterEvent(event) self.__events[event] = nil end
+function methods:UnregisterEvent(event)
+    if not __knownEvents[event] then
+        error("Attempt to unregister unknown event \"" .. tostring(event) .. "\"")
+    end
+    self.__events[event] = nil
+end
 function methods:UnregisterAllEvents() self.__events = {} end
 
-function methods:SetStatusBarTexture(texture)
-    if __badTextures[texture:lower()] then return false end
-    self.__barTexture = texture
-    return true
-end
-function methods:SetStatusBarColor(...) self.__barColor = { ... } end
-function methods:SetMinMaxValues(minimum, maximum) self.__min, self.__max = minimum, maximum end
-function methods:GetMinMaxValues() return self.__min, self.__max end
-function methods:SetValue(value) self.__value = value end
-function methods:GetValue() return self.__value end
-
 -- Button
-function methods:SetNormalTexture(texture) self.__normal = texture end
-function methods:SetHighlightTexture(texture) self.__highlight = texture end
-function methods:SetPushedTexture(texture) self.__pushed = texture end
 function methods:RegisterForClicks(...) self.__clicks = { ... } end
+function methods:SetNormalTexture(texture) self.__normal = texture end
+function methods:SetHighlightTexture(texture, blend) self.__highlight, self.__highlightBlend = texture, blend end
+function methods:SetPushedTexture(texture) self.__pushed = texture end
 
--- Texture
+-- Texture. A file id is a number, a path a string.
 function methods:SetTexture(texture)
-    if __badTextures[texture:lower()] then return false end
+    if type(texture) == "string" and __badTextures[texture:lower()] then return false end
+    if texture ~= nil and type(texture) ~= "string" and type(texture) ~= "number" then
+        error("SetTexture: not a path or a file id")
+    end
     self.__texture = texture
     return true
 end
 function methods:SetColorTexture(...) self.__color = { ... } end
-function methods:SetAtlas(atlas) self.__atlas = atlas; return true end
-function methods:SetBlendMode(mode) self.__blend = mode end
-function methods:SetVertexColor(...) self.__vertexColor = { ... } end
-
--- Texture animations, as far as the pulse uses them: an alpha bounce on the
--- border, looping BOUNCE.
-function methods:CreateAnimationGroup()
-    local group = __new_widget("AnimationGroup", self)
-    function group:SetLooping(loop) self.__looping = loop end
-    function group:Play() self.__playing = true end
-    function group:Stop() self.__playing = false end
-    function group:IsPlaying() return self.__playing == true end
-    function group:CreateAlpha()
-        local alpha = __new_widget("Alpha", group)
-        function alpha:SetFromAlpha(from) self.__from = from end
-        function alpha:SetToAlpha(to) self.__to = to end
-        function alpha:SetDuration(seconds) self.__duration = seconds end
-        return alpha
-    end
-    return group
+function methods:SetAtlas(atlas, useAtlasSize)
+    self.__atlas, self.__useAtlasSize = atlas, useAtlasSize == true
+    return true
 end
+function methods:SetBlendMode(mode) self.__blend = mode end
+function methods:SetDesaturated(desaturated) self.__desaturated = desaturated and true or false end
+function methods:SetVertexColor(...) self.__vertexColor = { ... } end
 
 -- CheckButton
 function methods:SetChecked(checked) self.__checked = checked and true or false end
 function methods:GetChecked() return self.__checked or false end
 
 -- FontString
-function methods:SetFontObject(object) self.__fontObject = object end
-function methods:SetText(text) self.__text = text end
+function methods:SetFontObject(object) self.__font = fontOf(object) and { unpack(fontOf(object)) } end
+function methods:SetFont(path, size, flags) self.__font = { path, size, flags }; return true end
+function methods:GetFont() if self.__font then return unpack(self.__font) end end
+function methods:SetText(text)
+    if self.__kind == "FontString" and not self.__font then error("FontString:SetText(): Font not set") end
+    self.__text = text
+end
 function methods:GetText() return self.__text end
 function methods:SetTextColor(r, g, b, a) self.__textColor = { r, g, b, a } end
 function methods:SetJustifyH(justify) self.__justify = justify end
@@ -570,13 +623,53 @@ function methods:ClearFocus()
     if self.__scripts.OnEditFocusLost then self.__scripts.OnEditFocusLost(self) end
 end
 
-function methods:IsMouseOver() return self.__mouseOver == true end
+-- Animation groups: alpha and flipbook animations, each on a target. A
+-- group plays until it is stopped or a test finishes it with __finish.
+local animationGroup = {}
+local animationGroupMeta = { __index = animationGroup }
+local animation = {}
+local animationMeta = { __index = animation }
+local ANIMATION_KINDS = { Alpha = true, FlipBook = true }
 
--- A click on a check button toggles first, then fires, as the client's does.
-function methods:Click()
-    if self.__kind == "CheckButton" then self:SetChecked(not self:GetChecked()) end
-    local handler = self.__scripts.OnClick
-    if handler then handler(self) end
+function animationGroup:SetLooping(mode) self.__looping = mode end
+function animationGroup:CreateAnimation(kind)
+    if not ANIMATION_KINDS[kind] then error("CreateAnimation: unknown animation type " .. tostring(kind)) end
+    local anim = setmetatable({ __kind = kind }, animationMeta)
+    self.__animations[#self.__animations + 1] = anim
+    return anim
+end
+function animationGroup:SetScript(name, handler) self.__scripts[name] = handler end
+function animationGroup:Play() self.__playing = true end
+function animationGroup:Stop() self.__playing = false end
+function animationGroup:IsPlaying() return self.__playing == true end
+
+-- A group that does not loop comes to its end, as the client's does.
+function __finish(group)
+    if not group:IsPlaying() then return end
+    group.__playing = false
+    if group.__scripts.OnFinished then group.__scripts.OnFinished(group) end
+end
+
+-- The group's animation of a kind, to read how it was set up.
+function __animation(group, kind)
+    for _, anim in ipairs(group.__animations) do
+        if anim.__kind == kind then return anim end
+    end
+end
+
+function animation:SetTarget(target) self.__target = target end
+function animation:SetOrder(order) self.__order = order end
+function animation:SetDuration(seconds) self.__duration = seconds end
+function animation:SetFromAlpha(alpha) self.__from = alpha end
+function animation:SetToAlpha(alpha) self.__to = alpha end
+function animation:SetFlipBookRows(rows) self.__rows = rows end
+function animation:SetFlipBookColumns(columns) self.__columns = columns end
+function animation:SetFlipBookFrames(count) self.__frames = count end
+function animation:SetFlipBookFrameWidth(width) self.__frameWidth = width end
+function animation:SetFlipBookFrameHeight(height) self.__frameHeight = height end
+
+function methods:CreateAnimationGroup()
+    return setmetatable({ __animations = {}, __scripts = {}, __parent = self }, animationGroupMeta)
 end
 
 local widgetMeta = { __index = methods }
@@ -594,11 +687,40 @@ function __new_widget(kind, parent)
     return widget
 end
 
+-- The widgets made with this parent, of this kind when one is given.
+function __children(parent, kind)
+    local found = {}
+    for _, widget in ipairs(frames) do
+        if widget.__parent == parent and (not kind or widget.__kind == kind) then
+            found[#found + 1] = widget
+        end
+    end
+    return found
+end
+
+--------------------------------------------------------------------------------
+-- Secure hooks
+--------------------------------------------------------------------------------
+
+-- Replaces the function with one that calls it, then the hook, with the same
+-- arguments, as the client's does.
+function hooksecurefunc(target, name, hook)
+    if type(target) == "string" then target, name, hook = _G, target, name end
+    local original = target[name]
+    if type(original) ~= "function" then error("hooksecurefunc: no function " .. tostring(name)) end
+    target[name] = function(...)
+        local results = { original(...) }
+        hook(...)
+        return unpack(results)
+    end
+end
+
 --------------------------------------------------------------------------------
 -- Menus
 --------------------------------------------------------------------------------
--- The client's menu descriptions for the right-click menu. A generator runs
--- against a tree the tests can read and click through.
+-- The client's menu descriptions, for the right-click menu and the settings
+-- page's dropdowns alike. A generator runs against a tree the tests can read
+-- and click through.
 
 local description = {}
 local descriptionMeta = { __index = description }
@@ -621,9 +743,33 @@ end
 function description:CreateRadio(text, isSelected, setSelected)
     return add(self, node("radio", text, isSelected, setSelected))
 end
-function description:SetScrollMode(extent) self.scroll = extent end
 
-function __new_menu_root() return node("root") end
+-- Finds a menu entry by its path of texts, for example ("Keep gold", "1g").
+function __menu_item(...)
+    local current = __menu
+    for i = 1, select("#", ...) do
+        local text = select(i, ...)
+        local found
+        for _, child in ipairs(current and current.children or {}) do
+            if child.text == text then found = child end
+        end
+        current = found
+    end
+    return current
+end
+
+-- Clicks a menu entry the way the client would.
+function __menu_click(item)
+    if item.kind == "button" then
+        if item.a then item.a() end
+    else
+        item.b()
+    end
+end
+
+function __menu_selected(item)
+    return item.a() and true or false
+end
 
 --------------------------------------------------------------------------------
 -- Templates
@@ -639,7 +785,7 @@ function CreateMinimalSliderFormatter(_, formatter) return formatter end
 
 local templates = {}
 
-templates.UICheckButtonTemplate = function(frame) frame.__kind = "CheckButton" end
+templates.UICheckButtonTemplate = function() end
 templates.UIPanelButtonTemplate = function() end
 
 -- The client's scroll frame, with the scroll bar its OnLoad makes.
@@ -652,6 +798,24 @@ end
 -- The client's input box: Escape clears the focus.
 templates.InputBoxTemplate = function(frame)
     frame:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+end
+
+-- The settings dropdown: SetupMenu keeps the generator and generates at once,
+-- GenerateMenu runs it again and shows the radio that is selected.
+templates.WowStyle1DropdownTemplate = function(frame)
+    function frame:SetupMenu(generator)
+        self.__generator = generator
+        self:GenerateMenu()
+    end
+    function frame:GenerateMenu()
+        local root = node("root")
+        self.__generator(self, root)
+        self.__menuRoot = root
+        self.__selectedText = nil
+        for _, child in ipairs(root.children) do
+            if child.kind == "radio" and child.a() then self.__selectedText = child.text end
+        end
+    end
 end
 
 -- The stepper slider: OnValueChanged fires when the value changes, whoever
@@ -704,23 +868,49 @@ function __control(label, template, kind)
     error("no " .. tostring(template or kind) .. " in the row labelled " .. tostring(label))
 end
 
+-- The value font string on a settings row: the row's text that is not its
+-- label.
+function __row_value(label)
+    for _, widget in ipairs(frames) do
+        if widget.__kind == "FontString" and widget.__text == label and widget.__parent ~= nil then
+            for _, other in ipairs(frames) do
+                if other.__parent == widget.__parent and other.__kind == "FontString" and other ~= widget then
+                    return other:GetText()
+                end
+            end
+        end
+    end
+    error("no settings row labelled " .. tostring(label))
+end
+
+-- Picks an entry in a settings dropdown the way the player would.
+function __dropdown_pick(dropdown, text)
+    dropdown:GenerateMenu()
+    for _, child in ipairs(dropdown.__menuRoot.children) do
+        if child.text == text then
+            child.b()
+            return
+        end
+    end
+    error("no entry " .. tostring(text) .. " in the dropdown")
+end
+
+function __dropdown_text(dropdown)
+    dropdown:GenerateMenu()
+    return dropdown.__selectedText
+end
+
+-- The settings page, once registered.
+function __settings_page()
+    return __settingsCategory and __settingsCategory.frame
+end
+
 -- The button on the settings page with this text.
 function __page_button(text)
     for _, widget in ipairs(frames) do
         if widget.__template == "UIPanelButtonTemplate" and widget.__text == text then return widget end
     end
     error("no button " .. tostring(text))
-end
-
--- Every text the settings page shows, for the read-only status rows.
-function __page_texts()
-    local texts = {}
-    for _, widget in ipairs(frames) do
-        if widget.__kind == "FontString" and widget.__text then
-            texts[#texts + 1] = widget.__text
-        end
-    end
-    return texts
 end
 
 -- Calls a widget's script handler the way the game would.
@@ -748,6 +938,111 @@ end
 function __frame_count() return #frames end
 
 --------------------------------------------------------------------------------
+-- The vendor window
+--------------------------------------------------------------------------------
+-- The Mainline MerchantFrame as far as Fletcher sees it: ten item buttons,
+-- each with its id set to its vendor index when the page is drawn, the page
+-- number, the tab, and the functions that draw it, which the addon hooks.
+
+local function buildMerchantFrame()
+    MERCHANT_ITEMS_PER_PAGE = 10
+    MerchantFrame = CreateFrame("Frame", "MerchantFrame", UIParent)
+    MerchantFrame.__shown = false
+    MerchantFrame.page = 1
+    MerchantFrame.selectedTab = 1
+    for i = 1, MERCHANT_ITEMS_PER_PAGE do
+        local merchantItem = CreateFrame("Frame", "MerchantItem" .. i, MerchantFrame)
+        local itemButton = CreateFrame("Button", "MerchantItem" .. i .. "ItemButton", merchantItem)
+        itemButton:SetSize(37, 37)
+    end
+
+    function MerchantFrame_UpdateMerchantInfo()
+        local count = #__merchant
+        for i = 1, MERCHANT_ITEMS_PER_PAGE do
+            local index = (MerchantFrame.page - 1) * MERCHANT_ITEMS_PER_PAGE + i
+            local itemButton = _G["MerchantItem" .. i .. "ItemButton"]
+            if index <= count then
+                itemButton:SetID(index)
+                itemButton:Show()
+            else
+                itemButton:Hide()
+            end
+        end
+    end
+
+    function MerchantFrame_UpdateBuybackInfo()
+        for i = 1, MERCHANT_ITEMS_PER_PAGE do
+            local itemButton = _G["MerchantItem" .. i .. "ItemButton"]
+            if i <= __buyback then
+                itemButton:SetID(i)
+                itemButton:Show()
+            else
+                itemButton:Hide()
+            end
+        end
+    end
+
+    -- Global lookups, so a hooked function runs its hook.
+    function MerchantFrame_Update()
+        if MerchantFrame.selectedTab == 1 then
+            MerchantFrame_UpdateMerchantInfo()
+        else
+            MerchantFrame_UpdateBuybackInfo()
+        end
+    end
+end
+
+-- Talks to a vendor with this list: the window shows and draws its first
+-- page, then MERCHANT_SHOW reaches the addons, the way the game orders it.
+function __open_vendor(list)
+    __merchant = list or {}
+    MerchantFrame.page = 1
+    MerchantFrame.selectedTab = 1
+    MerchantFrame:Show()
+    MerchantFrame_Update()
+    __fire("MERCHANT_SHOW")
+end
+
+function __close_vendor()
+    MerchantFrame:Hide()
+    __fire("MERCHANT_CLOSED")
+end
+
+function __merchant_page(page)
+    MerchantFrame.page = page
+    MerchantFrame_Update()
+end
+
+function __merchant_tab(tab)
+    MerchantFrame.selectedTab = tab
+    MerchantFrame_Update()
+end
+
+-- The vendor's list changed (its filter, or its stock), and the game says so.
+function __merchant_update(list)
+    if list then __merchant = list end
+    MerchantFrame_Update()
+    __fire("MERCHANT_UPDATE")
+end
+
+-- The mark Fletcher put on an item button on the page, when it is showing.
+function __overlay(place)
+    local itemButton = _G["MerchantItem" .. place .. "ItemButton"]
+    for _, child in ipairs(__children(itemButton, "Frame")) do
+        if child.glow then return child:IsShown() and child or nil end
+    end
+    return nil
+end
+
+-- Whether any font string says exactly this.
+function __text_shown(text)
+    for _, widget in ipairs(frames) do
+        if widget.__kind == "FontString" and widget.__text == text then return true end
+    end
+    return false
+end
+
+--------------------------------------------------------------------------------
 -- Client globals
 --------------------------------------------------------------------------------
 
@@ -756,10 +1051,17 @@ local function resetGlobals()
     UIParent = __new_widget("Frame")
     UIParent:SetSize(1920, 1080)
 
+    GameFontHighlightSmall = { __font = { "Fonts\\FRIZQT__.TTF", 10, "" } }
+    GameFontHighlight = { __font = { "Fonts\\FRIZQT__.TTF", 12, "" } }
     GameFontNormal = { __font = { "Fonts\\FRIZQT__.TTF", 12, "" } }
     GameFontHighlightLarge = { __font = { "Fonts\\FRIZQT__.TTF", 16, "" } }
     GameFontHighlightHuge = { __font = { "Fonts\\FRIZQT__.TTF", 20, "" } }
-    GameFontHighlightSmall = { __font = { "Fonts\\FRIZQT__.TTF", 10, "" } }
+
+    Enum = {
+        ItemClass = { Consumable = 0, Container = 1, Weapon = 2, Projectile = 6, Quiver = 11 },
+        ItemQuiverSubclass = { ObsoleteQuiver = 0, ObsoleteBolts = 1, Quiver = 2, Ammopouch = 3 },
+        ItemWeaponSubclass = { Bows = 2, Guns = 3, Thrown = 16, Crossbow = 18, Wand = 19 },
+    }
 
     -- The client's settings window: a canvas category per addon, opened by
     -- its ID, which shows the canvas frame.
@@ -777,9 +1079,10 @@ local function resetGlobals()
         end,
     }
 
-    __settingsOpened = nil
     __inCombat = false
+    function InCombatLockdown() return __inCombat end
     __shift = false
+    function IsShiftKeyDown() return __shift end
 
     GameTooltip = __new_widget("GameTooltip")
     GameTooltip.__shown = false
@@ -795,60 +1098,22 @@ local function resetGlobals()
     __menu = nil
     MenuUtil = {
         CreateContextMenu = function(owner, generator)
-            local root = __new_menu_root()
+            local root = node("root")
             generator(owner, root)
             __menu = root
         end,
     }
 
-    -- The vendor window: six item holders per page, each with its own item
-    -- button the highlight lives on, the tab set to the goods, page 1.
-    MerchantFrame = __new_widget("Frame")
-    MerchantFrame.page = 1
-    MerchantFrame.selectedTab = 1
-    for n = 1, MERCHANT_ITEMS_PER_PAGE do
-        local holder = __new_widget("Frame")
-        _G["MerchantItem" .. n] = holder
-        holder.ItemButton = __new_widget("Frame", holder)
-        holder.ItemButton:SetSize(37, 37)
-        holder:Hide()
-    end
+    C_Timer = {
+        After = function(delay, callback) schedule(delay, callback, 1) end,
+        NewTicker = function(interval, callback, iterations) return schedule(interval, callback, iterations) end,
+    }
 
-    LibStub = nil
     SlashCmdList = {}
     SLASH_FLETCHER1, SLASH_FLETCHER2 = nil, nil
-    FletcherDB = nil
     FletcherVendorButton = nil
-    __merchant = {}
-    __merchant_page = 1
-    __buy_log = {}
-end
 
--- Finds a menu entry by its path of texts, for example ("Keep gold", "5g").
-function __menu_item(...)
-    local current = __menu
-    for i = 1, select("#", ...) do
-        local text = select(i, ...)
-        local found
-        for _, child in ipairs(current and current.children or {}) do
-            if child.text == text then found = child end
-        end
-        current = found
-    end
-    return current
-end
-
--- Clicks a menu entry the way the client would.
-function __menu_click(item)
-    if item.kind == "button" then
-        if item.a then item.a() end
-    else
-        item.b()
-    end
-end
-
-function __menu_selected(item)
-    return item.a() and true or false
+    buildMerchantFrame()
 end
 
 --------------------------------------------------------------------------------
@@ -858,18 +1123,44 @@ end
 -- The events this client knows. A test removes one to check that a missing
 -- event does not stop the addon.
 local DEFAULT_EVENTS = {
-    "PLAYER_LOGIN", "PLAYER_REGEN_ENABLED",
-    "MERCHANT_SHOW", "MERCHANT_CLOSED", "MERCHANT_UPDATE",
-    "BAG_UPDATE_DELAYED", "PLAYER_MONEY", "UI_ERROR_MESSAGE",
-    "GET_ITEM_INFO_RECEIVED",
+    "PLAYER_LOGIN", "MERCHANT_SHOW", "MERCHANT_CLOSED", "MERCHANT_UPDATE",
+    "MERCHANT_FILTER_ITEM_UPDATE", "BAG_UPDATE_DELAYED", "UI_ERROR_MESSAGE",
+    "PLAYER_MONEY", "GET_ITEM_INFO_RECEIVED", "PLAYER_REGEN_ENABLED", "PLAYER_REGEN_DISABLED",
 }
 
--- Starts a fresh session: a clean world, the given saved settings, every file
--- the .toc lists loaded in order as the game loads them, and (unless told not
--- to) PLAYER_LOGIN fired. Returns the addon's namespace.
+-- Removes a global or a namespace member, "GetMoney" or "C_Item.GetItemCount".
+local function removeGlobal(name)
+    local space, member = name:match("^(.-)%.(.+)$")
+    if space then
+        local copy = {}
+        for key, value in pairs(_G[space] or {}) do copy[key] = value end
+        copy[member] = nil
+        _G[space] = copy
+    else
+        _G[name] = nil
+    end
+end
+
+-- The real functions, put back at every boot after a test removed one.
+local REAL = {
+    C_Item = C_Item, C_Container = C_Container, C_MerchantFrame = C_MerchantFrame,
+    GetMerchantNumItems = GetMerchantNumItems, GetMerchantItemID = GetMerchantItemID,
+    GetMerchantItemMaxStack = GetMerchantItemMaxStack, BuyMerchantItem = BuyMerchantItem,
+    GetInventoryItemID = GetInventoryItemID, GetInventoryItemCount = GetInventoryItemCount,
+    UnitUsesAmmo = UnitUsesAmmo, GetMoney = GetMoney,
+}
+
+-- Starts a fresh session: a clean world, the given character, bags and saved
+-- settings, every file the .toc lists loaded in order as the game loads
+-- them, and (unless told not to) PLAYER_LOGIN fired. Returns the addon's
+-- namespace. Options: interface, version, class, level, money, ranged, ammo,
+-- bags, db, missingEvents, remove (globals the client lacks), noSettings,
+-- noMenu, login.
 function __boot(options)
     options = options or {}
+    for name, value in pairs(REAL) do _G[name] = value end
     resetGlobals()
+    resetTimers()
 
     __output = {}
     __interface = options.interface or 16001
@@ -877,24 +1168,27 @@ function __boot(options)
     __class = options.class or "HUNTER"
     __level = options.level or 30
     __money = options.money or 0
-    __shift = options.shift and true or false
-
-    __items = {}
-    for id, item in pairs(options.items or {}) do __items[id] = item end
-    __bags = {}
-    for bag, bagState in pairs(options.bags or {}) do __bags[bag] = bagState end
-    __inv = {}
-    for bag, id in pairs(options.inv or {}) do __inv[bag] = id end
-    __ammo = options.ammo
     __ranged = options.ranged
+    __ammo = options.ammo
+    __bags = options.bags or { [0] = { slots = 16, contents = {} } }
+    __items = copyItems()
+    __merchant = {}
+    __buy_log = {}
+    __buyback = 2
+    __refuse = false
+    __itemCountSecret = false
+    __merchantCountSecret = false
+    deliveries = {}
     __badTextures = {}
-
-    __reset_timers()
     __knownEvents = {}
     for _, event in ipairs(DEFAULT_EVENTS) do __knownEvents[event] = true end
     for _, event in ipairs(options.missingEvents or {}) do __knownEvents[event] = nil end
+    for _, name in ipairs(options.remove or {}) do removeGlobal(name) end
     FletcherDB = options.db
     if options.noSettings then Settings = nil end
+    if options.noMenu then MenuUtil = nil end
+
+    __base_frames = #frames
 
     local ns = {}
     for _, entry in ipairs(__toc_files) do

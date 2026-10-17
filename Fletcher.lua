@@ -1,21 +1,23 @@
 -- Fletcher - Fletcher.lua
 -- A quiver refill for the hunter. When a hunter opens a vendor that sells
 -- ammo, Fletcher finds the equipped quiver or ammo pouch, picks the best
--- arrows or bullets the vendor sells that the hunter can use, marks that
--- item's icon in the vendor window, and buys exactly as many rounds as fill
--- every slot of the bag. Nothing is bought for normal bags, and an older
--- kind of ammo sitting in a slot is never moved, sold or replaced.
+-- arrows or bullets the vendor sells that the hunter can use, and buys a full
+-- stack for every empty slot of the bag, less what the normal bags already
+-- hold of that ammo. Nothing is bought for normal bags, and ammo already in a
+-- slot is never moved, sold or replaced. /fletcher, or /ammo for short,
+-- offers every option as a slash command.
 --
 -- The vendor window's own parts (the highlight, the button, the right-click
--- menu) are in Fletcher_Vendor.lua, the settings page in
--- Fletcher_Options.lua; all three change a setting only through the same
--- setter in ns.API.
+-- menu) are in Fletcher_Vendor.lua and the settings page in
+-- Fletcher_Options.lua. All three change a setting through the same setter
+-- in ns.API, at the end of this file.
 --
--- Cost: the vendor window's parts are built on the first MERCHANT_SHOW of a
--- hunter, never at load. Buying is event-driven and one purchase at a time,
--- advanced by the event the game sends after a purchase; the only timer is a
--- one-shot safety net per purchase step. A character that is not a hunter
--- unregisters everything at login and pays nothing after that.
+-- Cost: the vendor window's parts are built on a hunter's first MERCHANT_SHOW,
+-- never at load. While no vendor is open a hunter listens to MERCHANT_SHOW and
+-- MERCHANT_CLOSED only. Buying is one purchase at a time, each sent when the
+-- game reports the bags changed after the one before; the only timer is a
+-- one-shot safety net per purchase. A character that is not a hunter stops
+-- listening at login and pays nothing after that.
 
 local addonName, ns = ...
 
@@ -41,63 +43,85 @@ ns.Allowed = true
 --------------------------------------------------------------------------------
 -- Constants
 --------------------------------------------------------------------------------
+-- From Forever's own UI code (Gethe/wow-ui-source, branch forever, build
+-- 1.60.1.70450), unless marked "Seen in game" (the owner's in-game probe) or
+-- VERIFY: those still wait for it.
 
--- Inventory slots and the equipped bags. The ammo slot is slot 0 and the
--- ranged weapon slot is 18; the equipped bags are 1 to 4, and a bag is
--- itself an item sitting in the inventory slot ContainerIDToInventoryID
--- names. Values as names, so the logic never carries a bare number.
-local INVSLOT_AMMO   = 0
-local INVSLOT_RANGED = 18
-local FIRST_BAG, LAST_BAG = 1, 4
+local AMMO_SLOT   = 0  -- INVSLOT_AMMO, Blizzard_FrameXMLBase/Constants.lua
+local RANGED_SLOT = 18 -- INVSLOT_RANGED, the same file
 
--- Item classes and subclasses, as GetItemInfoInstant answers them. A bag of
--- class 11 (Container) with subclass 2 is a quiver (holds arrows) and
--- subclass 3 an ammo pouch (holds bullets); an item of class 6 (Projectile)
--- with subclass 2 is an arrow, subclass 3 a bullet; a weapon of class 2
--- (Weapon) with subclass 2 is a bow, 3 a gun and 18 a crossbow: bows and
--- crossbows shoot arrows, guns shoot bullets. Thrown weapons and wands
--- shoot nothing, and there is no ammo for them to mark.
-local ITEM_CLASS_CONTAINER  = 11
-local SUBCLASS_QUIVER, SUBCLASS_POUCH = 2, 3
-local ITEM_CLASS_PROJECTILE = 6
-local SUBCLASS_ARROW, SUBCLASS_BULLET = 2, 3
-local ITEM_CLASS_WEAPON     = 2
-local SUBCLASS_BOW, SUBCLASS_GUN, SUBCLASS_CROSSBOW = 2, 3, 18
+-- Bags 1 to NUM_BAG_SLOTS are the equipped bags; the reagent bag after them
+-- is left out. NUM_BAG_SLOTS is read at login.
+local BACKPACK = 0 -- Enum.BagIndex.Backpack
+local DEFAULT_BAG_SLOTS = 4
 
--- What each ranged weapon subclass shoots (nil when it shoots nothing): the
--- kind the highlight falls back to when no ammo bag is equipped.
-local RANGED_PROJECTILE = {
-    [SUBCLASS_BOW]      = SUBCLASS_ARROW,
-    [SUBCLASS_GUN]      = SUBCLASS_BULLET,
-    [SUBCLASS_CROSSBOW] = SUBCLASS_ARROW,
-}
+-- The projectile subclasses. The forever branch has no enum for them.
+-- Seen in game on 2026-10-17: C_Item.GetItemInfoInstant gives subclass 2 for
+-- Rough Arrow (2512) and 3 for Light Shot (2516).
+local PROJECTILE_ARROW, PROJECTILE_BULLET = 2, 3
 
--- Bag family bits, the same thing the bag's item class says in another way:
--- bit 0x1 marks a family that holds arrows, 0x2 one that holds bullets.
--- Read when the bag's own item cannot be read.
+-- The bag family bits C_Container.GetContainerNumFreeSlots reports for a
+-- quiver and an ammo pouch. Only read when the bag's own item class cannot
+-- be. Seen in game on 2026-10-17: a Medium Quiver reports 1. VERIFY the ammo
+-- pouch's 2 at a bullet vendor.
 local FAMILY_ARROWS, FAMILY_BULLETS = 0x1, 0x2
 
--- The kinds, named as the addon speaks of them.
-local KIND_PLURAL   = { [SUBCLASS_ARROW] = "arrows", [SUBCLASS_BULLET] = "bullets" }
-local KIND_SINGULAR = { [SUBCLASS_ARROW] = "arrow",  [SUBCLASS_BULLET] = "bullet" }
+-- The safety net: a purchase the game has not delivered after this many
+-- seconds stops the refill.
+local BUY_TIMEOUT = 3
 
--- Money, in copper. The Keep gold and Spending cap settings are set in gold
--- ("1" and "0.5" on the slash command) and held in copper.
+-- How many times an item the vendor scan needs may come back still missing
+-- before Fletcher stops waiting for it.
+local MAX_ITEM_TRIES = 3
+
 local COPPER_PER_SILVER = 100
 local COPPER_PER_GOLD   = 10000
-local MAX_GOLD          = 1000
+-- The most Keep gold and Spending cap take: ten thousand gold.
+local MAX_COPPER = 10000 * COPPER_PER_GOLD
+
+-- The vendor button's icon when there is no ammo to show. VERIFY in game that
+-- it loads (the toc's icon is the same file).
+local DEFAULT_ICON = "Interface\\Icons\\INV_Ammo_Arrow_02"
+
+-- The colours the game's own tooltips use for a label and a hint line.
+local LABEL_COLOR = { 1.0, 0.82, 0.0 }
+local HINT_COLOR  = { 0.5, 0.5, 0.5 }
 
 -- The version the toc names, which the packager writes from the release tag,
--- "1.0.0" from a "v1.0.0" tag. Run straight from the repository, the toc
--- still holds the packager's placeholder, and there is no version to show.
+-- for example "v1.0.0". Run straight from the repository, the toc still holds
+-- the packager's placeholder, and there is no version to show.
 local VERSION
 do
-    local GetMetadata = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
+    local GetMetadata = C_AddOns and C_AddOns.GetAddOnMetadata
     local version = type(GetMetadata) == "function" and GetMetadata(addonName, "Version")
     if type(version) == "string" and version ~= "" and not version:find("@", 1, true) then
         VERSION = version
     end
 end
+
+-- The two kinds of ammo. The bag decides which one is bought: a quiver holds
+-- arrows, an ammo pouch holds bullets. bagSubclass is filled in at login from
+-- the client's Enum.ItemQuiverSubclass.
+local KINDS = {
+    arrow  = { projectile = PROJECTILE_ARROW,  family = FAMILY_ARROWS,
+               noun = "arrows",  holder = "quiver",     title = "Quiver" },
+    bullet = { projectile = PROJECTILE_BULLET, family = FAMILY_BULLETS,
+               noun = "bullets", holder = "ammo pouch", title = "Ammo pouch" },
+}
+local KIND_ORDER = { "arrow", "bullet" }
+
+-- Ready-made amounts for the right-click menu, in copper.
+local KEEP_PRESETS = { 0, 10 * COPPER_PER_SILVER, COPPER_PER_GOLD, 5 * COPPER_PER_GOLD,
+    10 * COPPER_PER_GOLD, 50 * COPPER_PER_GOLD }
+local CAP_PRESETS = { 0, 50 * COPPER_PER_SILVER, COPPER_PER_GOLD, 5 * COPPER_PER_GOLD,
+    10 * COPPER_PER_GOLD }
+
+-- What to do when the ammo slot holds better ammo than the vendor sells. The
+-- key is what is saved and the slash command word.
+local BETTER_CHOICES = {
+    { key = "skip", name = "Buy nothing" },
+    { key = "fill", name = "Fill empty slots" },
+}
 
 local DEFAULTS = {
     autoBuy        = true,
@@ -106,111 +130,83 @@ local DEFAULTS = {
     pulse          = true,
     report         = true,
     showButton     = true,
-    keepCopper     = 0,  -- money never goes below this
-    capCopper      = 0,  -- 0 means no cap per refill
+    keepCopper     = 0, -- money never goes below this
+    capCopper      = 0, -- the most one refill spends; 0 means no cap
+    betterAmmo     = "skip",
 }
-
--- The colours the game's own tooltips use, for a label line and for a hint
--- line.
-local LABEL_COLOR = { 1.0, 0.82, 0.0 }
-local HINT_COLOR  = { 0.5, 0.5, 0.5 }
-
--- A purchase that no bag update follows within this many seconds stops the
--- refill. A safety net, not logic: the refill walks on the game's own
--- events, never on a timer.
-local STEP_TIMEOUT = 3
-
--- An item whose details are not cached yet is waited for at most this many
--- GET_ITEM_INFO_RECEIVED events; after that the visit goes on with what is
--- cached, silently without it.
-local MAX_INFO_TRIES = 3
-
--- The money amounts the right-click menu offers, as copper, with their
--- names. None first: a reserve of 0 means "spend it all", a cap of 0 means
--- no cap.
-local KEEP_CHOICES = {
-    { copper = 0,      name = "None" },
-    { copper = 1000,   name = "10s" },
-    { copper = 10000,  name = "1g" },
-    { copper = 50000,  name = "5g" },
-    { copper = 100000, name = "10g" },
-    { copper = 500000, name = "50g" },
-}
-local CAP_CHOICES = {
-    { copper = 0,      name = "None" },
-    { copper = 5000,   name = "50s" },
-    { copper = 10000,  name = "1g" },
-    { copper = 50000,  name = "5g" },
-    { copper = 100000, name = "10g" },
-}
-
--- The quiver icon when nothing fits to show on the vendor button. VERIFY:
--- the texture the client draws for a quiver's icon is confirmed on the
--- client; the fallback below is the plan's other candidate if it does not
--- load.
-local QUIVER_ICON = "Interface\\Icons\\INV_Ammo_Arrow_02"
 
 --------------------------------------------------------------------------------
 -- State
 --------------------------------------------------------------------------------
 
-local db          -- FletcherDB, set at PLAYER_LOGIN
-local active      -- a hunter
+local db             -- FletcherDB, set at PLAYER_LOGIN
+local active = false -- a hunter, on a client with everything Fletcher reads
 local isHunter = false
+local lastBag = DEFAULT_BAG_SLOTS
 
--- The quiver, as last read. One table, refilled in place, so a refresh
--- allocates nothing. bags holds the indexes of the containers the refill
--- fills: bags.n is the count, bags[1..n] the indexes.
-local quiver = {
-    present = false, -- a quiver or ammo pouch is equipped
-    kind = nil,      -- what the bag holds: SUBCLASS_ARROW or SUBCLASS_BULLET
-    name = nil,      -- the bag's name, when the item is cached
-    bags = { n = 0 },
-    stackSize = nil, -- the chosen ammo's stack
-    capacity = 0,    -- rounds the bag holds when every slot is full
-    rounds = 0,      -- rounds of the chosen ammo it holds now
-    need = 0,        -- rounds the refill wants (0 when the bag is full)
+-- The item classes Fletcher reads, from the client's enums at login.
+local CLASS_WEAPON, CLASS_PROJECTILE, CLASS_QUIVER
+local WEAPONS = {} -- ranged weapon subclass -> { kind, noun }
+
+-- Everything read about the quiver, the ranged weapon, the ammo slot and the
+-- open vendor, refilled in place by Evaluate. Fletcher_Vendor.lua reads it
+-- and never writes it.
+local scan = {
+    open = false,       -- a vendor window is open
+    kind = nil,         -- "arrow" or "bullet": what the equipped quiver holds
+    weaponKind = nil,   -- what the ranged weapon fires, when it uses ammo
+    weaponNoun = nil,   -- "bow", "crossbow" or "gun"
+    bags = nil,         -- the bag numbers of the quiver(s) of `kind`
+    quiverName = nil,
+    quiverIcon = nil,
+    sellsAmmo = false,  -- the vendor sells ammo of either kind
+    best = nil,         -- the best ammo of `kind` (or the weapon's) the vendor sells
+    others = {},        -- vendor index -> true, for the other usable ammo of that kind
+    loading = false,    -- an item the scan needs is not cached yet
+    loadedID = nil,     -- the ammo in the ammo slot
+    loadedName = nil,
+    loadedBetter = false, -- it beats the vendor's best
+    slots = 0,          -- the quiver's slots
+    emptySlots = 0,     -- the ones a refill fills
+    rounds = 0,         -- rounds in the quiver, of any ammo
+    need = 0,           -- a full stack of the chosen ammo per empty slot
+    spare = 0,          -- rounds of the chosen ammo in the normal bags
+    buyRounds = 0,      -- what a refill would buy now, within the money limits
+    buyCost = 0,
+    leftOut = 0,        -- rounds the money limits leave out
+    limit = nil,        -- which limit: "keep", "cap" or "money"
+    status = "none",    -- why a refill would or would not buy, see PlanPurchase
+    message = nil,      -- the same, in words
 }
+ns.scan = scan
 
--- The ranged weapon, as last read: whether one is equipped and the
--- projectile it shoots (nil when it shoots nothing, or when the weapon
--- cannot be read).
-local ranged = { present = false, shoots = nil }
+local bagsByKind = { arrow = {}, bullet = {} }
+local quiverByKind = {}
+local NO_BAGS = {}
 
--- The vendor visit. A vendor is "open" from MERCHANT_SHOW to
--- MERCHANT_CLOSED; that is when the refills live. All of it refilled in
--- place.
-local shopping = {
-    open = false,    -- a vendor is on screen
-    active = false,  -- a refill is walking its purchases
-    reason = nil,    -- "auto" or "manual", for what a stop says
+-- The vendor's usable ammo, one record per item, reused from visit to visit.
+local candidates = {}
+local numCandidates = 0
 
-    -- The chosen ammo, fixed when the refill started.
-    index = nil,     -- the vendor index to buy from
-    itemID = nil,    -- the ammo's item id
-    name = nil,      -- its name, for the report line
-    kind = nil,      -- SUBCLASS_ARROW or SUBCLASS_BULLET, for the report line
-    unitPrice = nil, -- the price of one round
+local waiting = {}          -- item id -> true, for items the scan is missing
+local itemTries = 0         -- times one came back still missing
+local gaveUp = false        -- stopped waiting this visit
+local autoPending = false   -- this visit's auto buy has not run yet
+local manualPending = false -- a Refill click is waiting for item data
+local warned = false        -- the weapon mismatch was mentioned this visit
 
-    -- The need is fixed at the start, and the queue never buys more than
-    -- what is left of it.
-    left = 0,        -- rounds still to buy
-    pending = 0,     -- rounds of the purchase that is in flight
-    bought = 0,      -- rounds bought so far
-    spent = 0,       -- copper spent so far
-
-    -- The wait states: a purchase goes out and its bag update comes in; an
-    -- item's details may still arrive from the client's cache.
-    waiting = false,     -- a purchase is out, its bag update not in yet
-    watchingInfo = false -- GET_ITEM_INFO_RECEIVED is registered for the visit
-    -- and its retries:
+-- The refill in progress. Its plan is fixed when it starts.
+local order = {
+    active = false,
+    itemID = nil, name = nil, index = nil,
+    price = 0, batch = 1, step = 1,
+    remaining = 0,     -- rounds still to ask for; it only ever goes down
+    asked = 0,         -- the purchase in flight, in rounds
+    countBefore = nil, -- the item's count in the bags before it
+    bought = 0, spent = 0,
+    leftOut = 0, limit = nil,
+    token = 0,         -- which purchase the running safety net belongs to
 }
-local infoTries = 0 -- GET_ITEM_INFO_RECEIVED events waited through this visit
-
--- Whether the visit has yet said the warning about an ammo bag that holds
--- another kind than the weapon shoots. Said once per visit, so it resets at
--- open.
-local warnedMismatch = false
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -225,11 +221,16 @@ local function SafeValue(value)
     return value
 end
 
--- A number from the game, or nil: SafeValue for anything the logic does
--- arithmetic on.
-local function SafeNumber(value)
+-- A number from the game, or nil for anything else, a secret or not a number
+-- included.
+local function Number(value)
     value = SafeValue(value)
-    return type(value) == "number" and value or nil
+    if type(value) == "number" and value == value then return value end
+    return nil
+end
+
+local function Bool(value)
+    return SafeValue(value) == true
 end
 
 local function Print(text)
@@ -240,229 +241,66 @@ local function Clamp(value, low, high)
     return math.max(low, math.min(high, value))
 end
 
-local function Round(value)
-    return math.floor(value + 0.5)
+local function Wipe(list)
+    for key in pairs(list) do list[key] = nil end
 end
 
--- The bit library's band does this on the client; without it, and in the
--- Lua of the test harness, the same test by hand.
-local band
-do
-    local ok, library = pcall(function() return bit end)
-    if ok and type(library) == "table" and type(library.band) == "function" then
-        band = library.band
-    end
-end
-local function HasBit(family, bitValue)
-    if band then return band(family, bitValue) ~= 0 end
-    return math.floor(family / bitValue) % 2 == 1
+-- Whether a flag is set in a bit field, without the bit library.
+local function HasBit(value, flag)
+    return math.floor(value / flag) % 2 == 1
 end
 
--- 350 copper as "3s 50c", 10000 as "1g", 0 as "0c". Plain text, no coin
--- icons, so the settings and the reports read the same everywhere.
+-- A sentence for the tooltip, as a chat line after "Fletcher:".
+local function ChatLine(text)
+    return text:sub(1, 1):lower() .. text:sub(2)
+end
+
+-- Copper as the game writes it in chat: "1g 2s 3c", leaving out what is zero.
 local function MoneyText(copper)
-    copper = math.max(0, math.floor(copper or 0))
+    copper = math.max(0, math.floor(copper + 0.5))
     local gold = math.floor(copper / COPPER_PER_GOLD)
-    copper = copper - gold * COPPER_PER_GOLD
-    local silver = math.floor(copper / COPPER_PER_SILVER)
-    local penny = copper - silver * COPPER_PER_SILVER
-    if gold > 0 then
-        if penny > 0 then
-            return ("%dg %ds %dc"):format(gold, silver, penny)
-        elseif silver > 0 then
-            return ("%dg %ds"):format(gold, silver)
-        end
-        return ("%dg"):format(gold)
-    elseif silver > 0 then
-        if penny > 0 then return ("%ds %dc"):format(silver, penny) end
-        return ("%ds"):format(silver)
-    end
-    return ("%dc"):format(penny)
+    local silver = math.floor(copper / COPPER_PER_SILVER) % 100
+    local rest = copper % COPPER_PER_SILVER
+    local text = ""
+    if gold > 0 then text = ("%dg"):format(gold) end
+    if silver > 0 then text = text .. (text ~= "" and " " or "") .. ("%ds"):format(silver) end
+    if rest > 0 or text == "" then text = text .. (text ~= "" and " " or "") .. ("%dc"):format(rest) end
+    return text
 end
 
---------------------------------------------------------------------------------
--- Game calls
---------------------------------------------------------------------------------
--- Forever runs the 1.x game on a modern client, where several of the calls
--- the logic needs exist as both a C_ table method and an old global function
--- with the same name. Each of these wrappers prefers the C_ form and falls
--- back to the global, the way BeastXP picks C_AddOns.GetAddOnMetadata or
--- GetAddOnMetadata.
---
--- The Phase 0 probe answers what Forever really is; until its answers are
--- in, whatever a wrapper assumes is marked VERIFY(phase0) next to it, and
--- the stub exercises the assumption as it stands. The owner's answers pin
--- each mark.
-
--- VERIFY(phase0): what Forever's C_MerchantFrame.GetItemInfo(index) answers
--- - an info table, as retail 12.0 does (the probe dumps it), or nothing and
--- the old GetMerchantItemInfo answer stands. Both spellings of every field
--- are read until the answer is in.
-local function MerchantItemInfo(index)
-    local reader = C_MerchantFrame and C_MerchantFrame.GetItemInfo
-    if type(reader) ~= "function" then reader = GetMerchantItemInfo end
-    if type(reader) ~= "function" then return nil end
-    local first, texture, price, rounds, stock, usable, extra = reader(index)
-    if type(first) == "table" then
-        -- The info table: every field in whichever spelling it names, a
-        -- nil taken for an unknown, and a false never swapped for one.
-        local info = first
-        local kind = info.name
-        if kind == nil then kind = info.itemName end
-        local roundsRead = info.quantity
-        if roundsRead == nil then roundsRead = info.stackCount end
-        if roundsRead == nil then roundsRead = info.batch end
-        local stockRead = info.numAvailable
-        if stockRead == nil then stockRead = info.count end
-        local usableRead = info.isUsable
-        if usableRead == nil then usableRead = info.usable end
-        return kind, info.texture or info.icon,
-            info.price, roundsRead, stockRead, usableRead
-    end
-    -- The old value list: name, texture, price, quantity, numAvailable,
-    -- isUsable, ...
-    return first, texture, price, rounds, stock, usable, extra
+-- Copper as a number of gold for typing: 5000 becomes "0.5".
+local function GoldText(copper)
+    local text = ("%.4f"):format(copper / COPPER_PER_GOLD)
+    text = text:gsub("0+$", "")
+    text = text:gsub("%.$", "")
+    return text
 end
 
--- VERIFY(phase0): the shape of the modern GetItemInfoInstant (the probe
--- dumps it) - the class and subclass expected as the sixth and seventh
--- returns of either form.
-local function ItemClassOf(itemID)
-    if itemID == nil then return nil end
-    local reader = C_Item and C_Item.GetItemInfoInstant or GetItemInfoInstant
-    if type(reader) ~= "function" then
-        -- No instant call on this client: the plain GetItemInfo answers
-        -- class and subclass, when the item is cached.
-        local data = ItemInfo(itemID)
-        if data == nil then return nil end
-        return data.class, data.subclass
-    end
-    return SafeNumber(select(6, reader(itemID))), SafeNumber(select(7, reader(itemID)))
-end
-
--- VERIFY(phase0): that the item level is the fourth return, the required
--- level the fifth and the stack size the eighth of GetItemInfo, and that
--- C_Item's copy answers the same returns as the global. An item the client
--- has not cached yet answers nothing.
-local function ItemInfo(itemID)
-    if itemID == nil then return nil end
-    local reader = C_Item and C_Item.GetItemInfo or GetItemInfo
-    if type(reader) ~= "function" then return nil end
-    local name, _, _, iLevel, reqLevel, class, subclass, stackSize = reader(itemID)
-    if name == nil then return nil end
-    return {
-        name = SafeValue(name),
-        iLevel = SafeNumber(iLevel),
-        reqLevel = SafeNumber(reqLevel),
-        class = SafeNumber(class),
-        subclass = SafeNumber(subclass),
-        stackSize = SafeNumber(stackSize),
-    }
-end
-
-local function NumMerchantItems()
-    local reader = C_MerchantFrame and C_MerchantFrame.GetNumItems
-    if type(reader) ~= "function" then reader = GetMerchantNumItems end
-    return SafeNumber(type(reader) == "function" and reader() or nil)
-end
-
--- VERIFY(phase0): the id the vendor's index names. GetMerchantItemID has no
--- C_ form in the retail reference; the probe says what Forever has.
-local function VendorID(index)
-    return SafeNumber(GetMerchantItemID and GetMerchantItemID(index) or nil)
-end
-
--- VERIFY(phase0): what GetMerchantItemMaxStack returns for ammo - the most
--- rounds one BuyMerchantItem may ask, is what the split math takes it for.
-local function MaxPurchase(index)
-    return SafeNumber(GetMerchantItemMaxStack and GetMerchantItemMaxStack(index) or nil)
-end
-
-local function MerchantBuy(index, count)
-    local ok = pcall(BuyMerchantItem, index, count)
-    return ok and true or false
-end
-
--- VERIFY(phase0): what C_Container.GetContainerItemInfo answers on Forever -
--- an info table (whose fields the probe names: iconFileID, stackCount,
--- itemID, isLocked, on retail) or the old value list of
--- GetContainerItemInfo. ReadBagSlot reads both spellings.
-local function BagItem(bag, slot)
-    local reader = C_Container and C_Container.GetContainerItemInfo
-    if type(reader) == "function" then
-        local info = reader(bag, slot)
-        if type(info) == "table" then
-            local itemID = SafeValue(info.itemID)
-            if itemID == nil then return nil end
-            return SafeNumber(info.stackCount or info.count),
-                SafeNumber(itemID),
-                SafeValue(info.isLocked)
-        end
-        -- The C_ form answered like the old list after all.
-    end
-    if type(GetContainerItemInfo) ~= "function" then return nil end
-    local _, count, locked = GetContainerItemInfo(bag, slot)
-    if count == nil then return nil end
-    return SafeNumber(count),
-        SafeNumber(GetContainerItemID and GetContainerItemID(bag, slot) or nil),
-        SafeValue(locked)
-end
-
--- VERIFY(phase0): whether C_Container.GetContainerNumFreeSlots' second
--- return names the bag family, as the old global does.
-local function BagFamily(bag)
-    local reader = C_Container and C_Container.GetContainerNumFreeSlots
-    if type(reader) ~= "function" then reader = GetContainerNumFreeSlots end
-    if type(reader) ~= "function" then return nil end
-    return SafeValue(select(2, reader(bag)))
-end
-
--- VERIFY(phase0): whether C_Container.GetContainerNumSlots is there (retail
--- names it so) or the old global GetContainerNumSlots.
-local function BagSlots(bag)
-    local reader = C_Container and C_Container.GetContainerNumSlots
-    if type(reader) ~= "function" then reader = GetContainerNumSlots end
-    return SafeNumber(type(reader) == "function" and reader(bag) or nil)
-end
-
--- VERIFY(phase0): whether C_Container.ContainerIDToInventoryID is there
--- (retail has it); the old global of the same name answers the same slot.
-local function BagInventorySlot(bag)
-    local reader = C_Container and C_Container.ContainerIDToInventoryID
-    if type(reader) ~= "function" then reader = ContainerIDToInventoryID end
-    return SafeNumber(type(reader) == "function" and reader(bag) or nil)
-end
-
-local function PlayerLevel()
-    return SafeNumber(UnitLevel("player"))
-end
-
-local function PlayerMoney()
-    return SafeNumber(GetMoney())
-end
-
--- The item in a player's inventory slot (the equipped bags sit in them too).
-local function InventoryItemID(slot)
-    return SafeNumber(GetInventoryItemID and GetInventoryItemID("player", slot) or nil)
-end
-
--- The stack in an inventory slot, in the game's own count.
-local function InventoryCount(slot)
-    return SafeNumber(GetInventoryItemCount and GetInventoryItemCount("player", slot) or nil)
+-- A typed amount of gold, "1", "0.5", ".25", "2g" or, with a decimal comma,
+-- "1,5", as copper; nil for anything else.
+local function ParseGold(word)
+    local number = tonumber(word:gsub(",", "."):match("^(%d*%.?%d+)g?$") or "")
+    if not number then return nil end
+    return math.floor(number * COPPER_PER_GOLD + 0.5)
 end
 
 --------------------------------------------------------------------------------
 -- Settings
 --------------------------------------------------------------------------------
 -- Account-wide: the Forever client writes a per-character SavedVariables file
--- but never loads it back. Everything applies live, since the beta client
--- does not reliably keep a write across a reload either.
+-- but never loads it back. Everything applies live, since the beta client does
+-- not reliably keep a write across a reload either.
 
--- Whole copper in the settings' range, or nil for anything else (including a
--- NaN, which the type check lets through and no comparison understands).
-local function FixCopper(value)
-    if type(value) ~= "number" or value ~= value then return nil end
-    return Clamp(Round(value), 0, MAX_GOLD * COPPER_PER_GOLD)
+local function ValidCopper(value)
+    if type(value) ~= "number" or value ~= value then return 0 end
+    return Clamp(math.floor(value + 0.5), 0, MAX_COPPER)
+end
+
+local function KnownBetter(key)
+    for _, choice in ipairs(BETTER_CHOICES) do
+        if choice.key == key then return true end
+    end
+    return false
 end
 
 local function InitDB()
@@ -473,552 +311,774 @@ local function InitDB()
         if type(db[key]) ~= type(value) then db[key] = value end
     end
 
-    db.keepCopper = FixCopper(db.keepCopper) or DEFAULTS.keepCopper
-    db.capCopper  = FixCopper(db.capCopper) or DEFAULTS.capCopper
+    db.keepCopper = ValidCopper(db.keepCopper)
+    db.capCopper = ValidCopper(db.capCopper)
+    if not KnownBetter(db.betterAmmo) then db.betterAmmo = DEFAULTS.betterAmmo end
 end
 
 --------------------------------------------------------------------------------
--- Reading the quiver
+-- What the client must have
 --------------------------------------------------------------------------------
+-- Forever is a 1.x game on the modern client: the old globals
+-- (GetMerchantItemInfo, GetItemInfo, GetContainerNumFreeSlots, ...) are gone,
+-- and only the C_ forms are used. Each is checked once at login; a client
+-- without one gets one line and no Fletcher, never an error at a vendor.
 
--- What bag `bag` holds, by its item class first (a bag is an item sitting in
--- the inventory slot ContainerIDToInventoryID names), then by its bag family
--- bits. SUBCLASS_ARROW, SUBCLASS_BULLET, or nil.
-local function BagKind(bag)
-    local inventorySlot = BagInventorySlot(bag)
-    local bagItemID = inventorySlot and InventoryItemID(inventorySlot)
-    if type(bagItemID) == "number" then
-        local class, subclass = ItemClassOf(bagItemID)
-        if class == ITEM_CLASS_CONTAINER then
-            if subclass == SUBCLASS_QUIVER then return SUBCLASS_ARROW end
-            if subclass == SUBCLASS_POUCH then return SUBCLASS_BULLET end
+local REQUIRED_API = {
+    "C_MerchantFrame.GetItemInfo",
+    "C_Item.GetItemInfo",
+    "C_Item.GetItemInfoInstant",
+    "C_Item.GetItemCount",
+    "C_Container.GetContainerNumSlots",
+    "C_Container.GetContainerItemInfo",
+    "C_Container.GetContainerNumFreeSlots",
+    "C_Container.ContainerIDToInventoryID",
+    "GetMerchantNumItems",
+    "GetMerchantItemID",
+    "GetMerchantItemMaxStack",
+    "BuyMerchantItem",
+    "GetInventoryItemID",
+    "GetInventoryItemCount",
+    "UnitUsesAmmo",
+    "GetMoney",
+}
+
+-- The first call the client does not have, or nil.
+local function MissingAPI()
+    for _, name in ipairs(REQUIRED_API) do
+        local space, member = name:match("^(.-)%.(.+)$")
+        local found
+        if space then
+            local namespace = _G[space]
+            found = type(namespace) == "table" and namespace[member]
+        else
+            found = _G[name]
         end
-    end
-    local family = BagFamily(bag)
-    if type(family) == "number" then
-        if HasBit(family, FAMILY_ARROWS) then return SUBCLASS_ARROW end
-        if HasBit(family, FAMILY_BULLETS) then return SUBCLASS_BULLET end
+        if type(found) ~= "function" then return name end
     end
     return nil
 end
 
--- The quiver, as last read: whether an ammo bag is equipped, what it holds,
--- and which bags the refill fills. The first ammo bag in the scan decides
--- the kind (the bag decides, as the owner asked); every other bag of the
--- same kind joins the list.
-local function ReadQuiver()
-    quiver.present = false
-    quiver.kind = nil
-    quiver.name = nil
-    quiver.bags.n = 0
-    for bag = FIRST_BAG, LAST_BAG do
-        local kind = BagKind(bag)
+-- The item classes and subclasses, from the client's own enums. False when
+-- one is missing.
+local function ReadEnums()
+    local itemClass = type(Enum) == "table" and Enum.ItemClass
+    local quiverClass = type(Enum) == "table" and Enum.ItemQuiverSubclass
+    local weaponClass = type(Enum) == "table" and Enum.ItemWeaponSubclass
+    if type(itemClass) ~= "table" or type(quiverClass) ~= "table" or type(weaponClass) ~= "table" then
+        return false
+    end
+    local numbers = {
+        itemClass.Weapon, itemClass.Projectile, itemClass.Quiver,
+        quiverClass.Quiver, quiverClass.Ammopouch,
+        weaponClass.Bows, weaponClass.Crossbow, weaponClass.Guns,
+    }
+    for i = 1, 8 do
+        if type(numbers[i]) ~= "number" then return false end
+    end
+
+    CLASS_WEAPON, CLASS_PROJECTILE, CLASS_QUIVER = itemClass.Weapon, itemClass.Projectile, itemClass.Quiver
+    KINDS.arrow.bagSubclass = quiverClass.Quiver
+    KINDS.bullet.bagSubclass = quiverClass.Ammopouch
+    -- Thrown weapons and wands use no ammo, so they are not listed.
+    WEAPONS[weaponClass.Bows] = { kind = "arrow", noun = "bow" }
+    WEAPONS[weaponClass.Crossbow] = { kind = "arrow", noun = "crossbow" }
+    WEAPONS[weaponClass.Guns] = { kind = "bullet", noun = "gun" }
+    return true
+end
+
+--------------------------------------------------------------------------------
+-- Reading items
+--------------------------------------------------------------------------------
+-- The only places that call the item, container and merchant APIs. Each
+-- result passes through SafeValue, and anything unknown comes back as nil.
+
+-- Class, subclass and icon, which the client answers at once, cached or not.
+local function ItemClass(itemID)
+    if not itemID then return nil end
+    local _, _, _, _, icon, classID, subclassID = C_Item.GetItemInfoInstant(itemID)
+    return Number(classID), Number(subclassID), SafeValue(icon)
+end
+
+-- Name, item level, required level and stack size. Nil until the client has
+-- the item cached; asking is what makes it fetch the item, and
+-- GET_ITEM_INFO_RECEIVED says when it is in.
+local function ItemDetails(itemID)
+    local name, _, _, itemLevel, minLevel, _, _, stackSize = C_Item.GetItemInfo(itemID)
+    name = SafeValue(name)
+    if type(name) ~= "string" then return nil end
+    return name, Number(itemLevel) or 0, Number(minLevel) or 0, Number(stackSize)
+end
+
+-- How many of an item the bags hold, or nil when the client will not say.
+local function ItemCount(itemID)
+    return Number(C_Item.GetItemCount(itemID))
+end
+
+-- "arrow" or "bullet" for ammo, nil for anything else.
+local function ProjectileKind(itemID)
+    local classID, subclassID = ItemClass(itemID)
+    if classID ~= CLASS_PROJECTILE then return nil end
+    for _, kind in ipairs(KIND_ORDER) do
+        if KINDS[kind].projectile == subclassID then return kind end
+    end
+    return nil
+end
+
+-- The item an equipped bag is, or nil for an empty bag slot.
+local function BagItem(bag)
+    local slot = Number(C_Container.ContainerIDToInventoryID(bag))
+    if not slot then return nil end
+    return Number(GetInventoryItemID("player", slot))
+end
+
+-- What a bag holds when it is a quiver or an ammo pouch, by its item class.
+-- When the class cannot be read, the bag's family says it instead.
+local function BagKind(bag, itemID)
+    local classID, subclassID = ItemClass(itemID)
+    if classID then
+        if classID ~= CLASS_QUIVER then return nil end
+        for _, kind in ipairs(KIND_ORDER) do
+            if KINDS[kind].bagSubclass == subclassID then return kind end
+        end
+        return nil
+    end
+    local _, family = C_Container.GetContainerNumFreeSlots(bag)
+    family = Number(family)
+    if not family then return nil end
+    for _, kind in ipairs(KIND_ORDER) do
+        if HasBit(family, KINDS[kind].family) then return kind end
+    end
+    return nil
+end
+
+-- The vendor index of an item, which moves when the vendor's filter changes.
+local function FindVendorIndex(itemID)
+    local count = Number(GetMerchantNumItems()) or 0
+    for index = 1, count do
+        if Number(GetMerchantItemID(index)) == itemID then return index end
+    end
+    return nil
+end
+
+--------------------------------------------------------------------------------
+-- The quiver, the weapon and the ammo slot
+--------------------------------------------------------------------------------
+
+-- What the ranged weapon fires. UnitUsesAmmo is the test the character sheet
+-- makes before it shows the ammo slot.
+local function ReadWeapon()
+    scan.weaponKind, scan.weaponNoun = nil, nil
+    if not Bool(UnitUsesAmmo("player")) then return end
+    local classID, subclassID = ItemClass(Number(GetInventoryItemID("player", RANGED_SLOT)))
+    if classID ~= CLASS_WEAPON then return end
+    local weapon = WEAPONS[subclassID]
+    if weapon then scan.weaponKind, scan.weaponNoun = weapon.kind, weapon.noun end
+end
+
+-- Finds the quiver or ammo pouch. The bag decides the kind; with one of each
+-- equipped, the one the ranged weapon fills wins.
+local function ReadQuivers()
+    Wipe(bagsByKind.arrow)
+    Wipe(bagsByKind.bullet)
+    Wipe(quiverByKind)
+    local first
+    for bag = 1, lastBag do
+        local itemID = BagItem(bag)
+        local kind = itemID and BagKind(bag, itemID)
         if kind then
-            if not quiver.kind then
-                quiver.present = true
-                quiver.kind = kind
-                -- The bag's own name, for the tooltip's quiver line, when
-                -- the item is cached.
-                local inventorySlot = BagInventorySlot(bag)
-                if inventorySlot then
-                    local data = ItemInfo(InventoryItemID(inventorySlot))
-                    quiver.name = data and data.name or nil
+            local bags = bagsByKind[kind]
+            bags[#bags + 1] = bag
+            quiverByKind[kind] = quiverByKind[kind] or itemID
+            first = first or kind
+        end
+    end
+
+    local kind = first
+    if scan.weaponKind and quiverByKind[scan.weaponKind] then kind = scan.weaponKind end
+    scan.kind = kind
+    scan.bags = kind and bagsByKind[kind] or NO_BAGS
+    scan.quiverName, scan.quiverIcon = nil, nil
+    if kind then
+        local quiverID = quiverByKind[kind]
+        scan.quiverName = ItemDetails(quiverID) or KINDS[kind].title
+        scan.quiverIcon = select(3, ItemClass(quiverID))
+    end
+end
+
+-- One vendor item is better ammo than another: the higher required level,
+-- then the higher item level, then the cheaper single round, then the one
+-- higher in the list.
+local function Better(a, b)
+    if a.minLevel ~= b.minLevel then return a.minLevel > b.minLevel end
+    if a.itemLevel ~= b.itemLevel then return a.itemLevel > b.itemLevel end
+    -- Price per round is price over batch, compared without fractions.
+    local aRound, bRound = a.price * b.batch, b.price * a.batch
+    if aRound ~= bRound then return aRound < bRound end
+    return a.index < b.index
+end
+
+-- For sale for gold alone, in stock, and usable by this character.
+local function ForSale(info)
+    local price, batch, stock = Number(info.price), Number(info.stackCount), Number(info.numAvailable)
+    return Bool(info.isUsable) and Bool(info.isPurchasable) and SafeValue(info.hasExtendedCost) == false
+        and price ~= nil and price >= 0 and batch ~= nil and batch >= 1
+        and stock ~= nil and stock ~= 0 -- -1 is an unlimited stock
+end
+
+-- Ranks the vendor's ammo of one kind. The list is the one the player sees,
+-- after the vendor window's filter; Fletcher never changes the filter.
+local function ScanVendor(kind)
+    numCandidates = 0
+    scan.best, scan.sellsAmmo = nil, false
+    Wipe(scan.others)
+    if not scan.open then return end
+
+    local level = Number(UnitLevel("player"))
+    local count = Number(GetMerchantNumItems()) or 0
+    for index = 1, count do
+        local itemID = Number(GetMerchantItemID(index))
+        local itemKind = ProjectileKind(itemID)
+        if itemKind then scan.sellsAmmo = true end
+
+        local info = itemKind and itemKind == kind and SafeValue(C_MerchantFrame.GetItemInfo(index))
+        if type(info) == "table" and ForSale(info) then
+            local name, itemLevel, minLevel, stackSize = ItemDetails(itemID)
+            if not name then
+                waiting[itemID] = true
+            elseif stackSize and stackSize >= 1 and (not level or minLevel <= level) then
+                numCandidates = numCandidates + 1
+                local record = candidates[numCandidates]
+                if not record then
+                    record = {}
+                    candidates[numCandidates] = record
                 end
-            end
-            if kind == quiver.kind then
-                quiver.bags.n = quiver.bags.n + 1
-                quiver.bags[quiver.bags.n] = bag
+                record.index, record.itemID, record.name = index, itemID, name
+                record.texture = SafeValue(info.texture)
+                record.price = Number(info.price)
+                record.batch = math.floor(Number(info.stackCount))
+                record.itemLevel, record.minLevel, record.stackSize = itemLevel, minLevel, stackSize
+                -- The most rounds one BuyMerchantItem call buys. The game's
+                -- own stack split caps its total at this, in rounds. Seen in
+                -- game on 2026-10-17: 200 for every arrow, one vendor batch.
+                record.maxStack = Number(GetMerchantItemMaxStack(index))
+                if not scan.best or Better(record, scan.best) then scan.best = record end
             end
         end
     end
-end
 
--- The ranged weapon, as last read: whether one is equipped and the
--- projectile it shoots.
-local function ReadRanged()
-    ranged.present = false
-    ranged.shoots = nil
-    local weaponID = InventoryItemID(INVSLOT_RANGED)
-    if type(weaponID) ~= "number" then return end
-    local class, subclass = ItemClassOf(weaponID)
-    if class == ITEM_CLASS_WEAPON and RANGED_PROJECTILE[subclass] then
-        ranged.present = true
-        ranged.shoots = RANGED_PROJECTILE[subclass]
+    for i = 1, numCandidates do
+        local record = candidates[i]
+        if record ~= scan.best then scan.others[record.index] = true end
     end
 end
 
--- The ammo slot (INVSLOT_AMMO), as (itemID, count) or nil, nil.
-local function ReadAmmoSlot()
-    local itemID = InventoryItemID(INVSLOT_AMMO)
-    if type(itemID) ~= "number" then return nil, nil end
-    return itemID, InventoryCount(INVSLOT_AMMO)
-end
+-- The ammo in the ammo slot, and whether it beats the vendor's best: then it
+-- is crafted, reputation or raid ammo the hunter chose on purpose.
+local function ReadLoadedAmmo()
+    local loadedID = Number(GetInventoryItemID("player", AMMO_SLOT))
+    scan.loadedID, scan.loadedName, scan.loadedBetter = loadedID, nil, false
+    if not loadedID then return end
 
---------------------------------------------------------------------------------
--- What the quiver needs
---------------------------------------------------------------------------------
-
--- The rounds of `itemID` the quiver's slots still ask for, and what they
--- hold at all. Per slot:
---   an empty slot              needs a full stack;
---   a slot of the chosen ammo  needs the top of its stack up;
---   a slot of another ammo     counts as it is: never moved, sold or
---                              replaced;
---   a locked slot              counts as it is.
--- quiver.capacity, quiver.rounds and quiver.need are filled in place.
-local function ScanQuiver(itemID, stackSize)
-    if type(stackSize) ~= "number" or stackSize < 1 then
-        quiver.stackSize, quiver.capacity, quiver.rounds, quiver.need = nil, 0, 0, 0
+    local name, itemLevel, minLevel = ItemDetails(loadedID)
+    if not name then
+        waiting[loadedID] = true
         return
     end
-    quiver.stackSize = stackSize
-    quiver.capacity, quiver.rounds, quiver.need = 0, 0, 0
-    for i = 1, quiver.bags.n do
-        local bag = quiver.bags[i]
-        local bagSlots = BagSlots(bag) or 0
-        quiver.capacity = quiver.capacity + bagSlots * stackSize
-        for slot = 1, bagSlots do
-            local count, slotID, locked = BagItem(bag, slot)
-            if slotID == itemID and not locked and type(count) == "number" then
-                local inSlot = math.min(count, stackSize)
-                quiver.rounds = quiver.rounds + inSlot
-                quiver.need = quiver.need + (stackSize - inSlot)
-            elseif slotID == nil and not locked then
-                quiver.need = quiver.need + stackSize
-            end
-        end
+    scan.loadedName = name
+
+    local best = scan.best
+    if best and scan.kind and loadedID ~= best.itemID and ProjectileKind(loadedID) == scan.kind then
+        scan.loadedBetter = minLevel > best.minLevel
+            or (minLevel == best.minLevel and itemLevel > best.itemLevel)
     end
 end
 
---------------------------------------------------------------------------------
--- The best ammo the vendor sells
---------------------------------------------------------------------------------
-
--- The best candidate, as last searched. found says whether the vendor sells
--- one the hunter can use; waiting says whether the search is waiting for an
--- item's details to arrive from the client's cache, and will be run again
--- when they do. others holds the usable candidates that did not come out on
--- top ({ index, itemID, name } values), for the dim green highlight, in the
--- order they were seen.
-local best = {
-    found = false,
-    waiting = false,
-    index = nil,
-    itemID = nil,
-    name = nil,
-    texture = nil,   -- the icon, for the vendor button
-    reqLevel = nil,  -- the required level, for "Best here: ... (level n)"
-    stackSize = nil,
-    unitPrice = nil, -- the price of one round
-    others = { n = 0 },
-}
-
--- Whether a limited stock is gone. A nil or an unlimited marker is not
--- limited. VERIFY(phase0): what the vendor's stock return reads for
--- unlimited goods (the stub answers -1); any limited 0 means gone.
-local function StockGone(stock)
-    if type(stock) ~= "number" then return false end
-    return stock >= 0 and stock < 1
+-- Walks every slot of the quiver. A refill goes by the slots, not by how
+-- many rounds the quiver could hold: each empty slot gets one full stack.
+-- Seen in game on 2026-10-17: a bought batch of 200 Razor Arrows did not go
+-- on top of a stack of 90 in the quiver; it took an empty slot, and with none
+-- free it went into a normal bag, so the stack stayed at 90 and every visit
+-- bought another 200. So a part stack, like other ammo or a locked slot,
+-- needs nothing and is left alone. Returns the slots, the empty ones and the
+-- rounds in the quiver.
+local function ReadQuiver()
+    local slots, empty, rounds = 0, 0, 0
+    for _, bag in ipairs(scan.bags) do
+        local numSlots = Number(C_Container.GetContainerNumSlots(bag)) or 0
+        for slot = 1, numSlots do
+            slots = slots + 1
+            local info = SafeValue(C_Container.GetContainerItemInfo(bag, slot))
+            if type(info) ~= "table" then
+                empty = empty + 1
+            else
+                rounds = rounds + (Number(info.stackCount) or 0)
+            end
+        end
+    end
+    return slots, empty, rounds
 end
 
--- Whether `newest` rates better than `kept`: the highest required level
--- first, then the higher item level, then the lower price for one round. A
--- tie: the earlier candidate keeps it.
-local function RatesBetter(newest, kept)
-    if newest.reqLevel ~= kept.reqLevel then
-        return newest.reqLevel > kept.reqLevel
-    elseif newest.iLevel ~= kept.iLevel then
-        return newest.iLevel > kept.iLevel
-    elseif newest.unitPrice ~= kept.unitPrice then
-        return newest.unitPrice < kept.unitPrice
+local function IsQuiverBag(bag)
+    for _, quiverBag in ipairs(scan.bags) do
+        if quiverBag == bag then return true end
     end
     return false
 end
 
--- One candidate's own rating, reused, so the search allocates nothing.
-local candidate = { reqLevel = 0, iLevel = 0, unitPrice = 0 }
-
--- The best ammo of `kind` the vendor sells. Every candidate must be of the
--- right projectile subclass, usable by the vendor's own flag, not above the
--- player's level, and in stock where a stock is counted. best is filled in
--- place. An item whose details the client has not cached yet is left out of
--- this pass and the search says waiting, so the caller can run it again
--- when GET_ITEM_INFO_RECEIVED comes.
-local function SearchBest(kind)
-    best.found = false
-    best.waiting = false
-    best.others.n = 0
-    best.index, best.itemID, best.name, best.texture = nil, nil, nil, nil
-    best.reqLevel, best.stackSize, best.unitPrice = nil, nil, nil
-
-    local playerLevel = PlayerLevel()
-    local count = NumMerchantItems() or 0
-
-    for index = 1, count do
-        local itemID = VendorID(index)
-        if type(itemID) == "number" then
-            local class, subclass = ItemClassOf(itemID)
-            if class == ITEM_CLASS_PROJECTILE and subclass == kind then
-                local name, texture, price, rounds, stock, usable =
-                    MerchantItemInfo(index)
-                -- VERIFY(phase0): the rounds one purchase delivers, and
-                -- what the price is for. The reading here: `rounds` rounds
-                -- at `price` copper the lot; a 1-round vendor line prices
-                -- one round. With no rounds readable, 1.
-                rounds = type(rounds) == "number" and math.max(1, math.floor(rounds)) or 1
-                price = type(price) == "number" and math.max(0, price) or nil
-
-                local data = ItemInfo(itemID)
-
-                if data == nil then
-                    -- Not in the client's cache yet: leave it out and wait.
-                    best.waiting = true
-                    reqLevel, iLevel, stackSize = nil, nil, nil
-                else
-                    reqLevel, iLevel, stackSize = data.reqLevel, data.iLevel, data.stackSize
-                end
-
-                if data ~= nil and price ~= nil and usable ~= false
-                    and not StockGone(stock)
-                    and (playerLevel == nil or reqLevel == nil or reqLevel <= playerLevel) then
-                    candidate.reqLevel = reqLevel or 0
-                    candidate.iLevel = iLevel or 0
-                    candidate.unitPrice = price / rounds
-                    if not best.found or RatesBetter(candidate, best) then
-                        if best.found then
-                            -- The last best joins the other usable ones.
-                            best.others.n = best.others.n + 1
-                            best.others[best.others.n] = {
-                                index = best.index, itemID = best.itemID, name = best.name }
-                        end
-                        best.found = true
-                        best.index, best.itemID, best.name = index, itemID, name
-                        best.texture = texture
-                        best.reqLevel, best.stackSize = reqLevel, stackSize
-                        best.unitPrice = candidate.unitPrice
-                    else
-                        best.others.n = best.others.n + 1
-                        best.others[best.others.n] = {
-                            index = index, itemID = itemID, name = name }
-                    end
+-- Rounds of an item in the backpack and the equipped bags that are not the
+-- quiver. They count toward the need: Fletcher does not buy what the hunter
+-- already carries, and a purchase the game put in a normal bag is never
+-- bought again on the next visit.
+local function SpareRounds(itemID)
+    if not itemID then return 0 end
+    local spare = 0
+    for bag = BACKPACK, lastBag do
+        if not IsQuiverBag(bag) then
+            local numSlots = Number(C_Container.GetContainerNumSlots(bag)) or 0
+            for slot = 1, numSlots do
+                local info = SafeValue(C_Container.GetContainerItemInfo(bag, slot))
+                if type(info) == "table" and Number(info.itemID) == itemID then
+                    spare = spare + (Number(info.stackCount) or 0)
                 end
             end
         end
     end
+    return spare
 end
 
 --------------------------------------------------------------------------------
--- What the money allows
+-- What a refill buys
 --------------------------------------------------------------------------------
+-- From the source: BuyMerchantItem(index, quantity) takes a number of rounds,
+-- and the game's own vendor window only ever passes whole vendor batches (its
+-- stack split steps by the batch, stackCount). The server takes part of a
+-- batch too. Seen in game on 2026-10-17: BuyMerchantItem(i, 50) for Rough
+-- Arrow, sold 200 for 9c, delivered 50 arrows and took 3c.
+local PARTIAL_BATCHES = true
 
--- How many of the wanted rounds the money, the reserve and the cap allow.
--- The cap is per refill, so the copper already spent in this one counts
--- against it. 0 when not even one round fits.
-local function AffordRounds(wanted, unitPrice)
-    local money = PlayerMoney()
-    if type(money) ~= "number" or type(unitPrice) ~= "number" or unitPrice <= 0 then
-        return 0
+-- The only place that turns the rounds a quiver needs into what is bought.
+-- With part batches, that is the need itself. In whole batches, the need is
+-- rounded up, so the empty slots always end full and the few rounds over
+-- land in a normal bag; but less than half a batch buys nothing, so a need
+-- the bags almost cover is not sold a batch.
+local function BuyCount(rounds, batch)
+    if PARTIAL_BATCHES then return rounds end
+    if rounds * 2 < batch then return 0 end
+    return math.ceil(rounds / batch) * batch
+end
+
+-- What rounds of an item cost. The vendor's price is for one whole batch,
+-- and part of a batch costs its share rounded up to the copper (seen in game
+-- on 2026-10-17: 50 of 200 for 9c, 2.25c, took 3c).
+local function Cost(rounds, item)
+    if PARTIAL_BATCHES then return math.ceil(rounds * item.price / item.batch) end
+    return math.ceil(rounds / item.batch) * item.price
+end
+
+-- The most rounds a sum of copper buys.
+local function AffordableRounds(budget, item)
+    if item.price <= 0 then return math.huge end
+    if budget <= 0 then return 0 end
+    if PARTIAL_BATCHES then return math.floor(budget * item.batch / item.price) end
+    return math.floor(budget / item.price) * item.batch
+end
+
+-- The most rounds one purchase asks for.
+local function StepRounds(item)
+    local step = item.maxStack
+    if not step or step < 1 then step = item.batch end
+    if not PARTIAL_BATCHES then
+        step = math.max(item.batch, math.floor(step / item.batch) * item.batch)
+    end
+    return step
+end
+
+local function SetStatus(status, message)
+    scan.status, scan.message = status, message
+end
+
+-- Why a money limit left rounds out, as a sentence.
+local function LeftOutText(rounds, limit)
+    if limit == "keep" then
+        return ("Left out %d to keep %s."):format(rounds, MoneyText(db.keepCopper))
+    elseif limit == "cap" then
+        return ("Left out %d to stay under the %s spending cap."):format(rounds, MoneyText(db.capCopper))
+    end
+    return ("Left out %d you cannot afford."):format(rounds)
+end
+
+-- What a refill would buy now, and why when it is nothing. The status is one
+-- of: noquiver, loading, noammo, better, full, inbags, nearlyfull, money or
+-- ready.
+local function PlanPurchase()
+    scan.buyRounds, scan.buyCost, scan.leftOut, scan.limit = 0, 0, 0, nil
+    local best = scan.best
+
+    if not scan.kind then
+        return SetStatus("noquiver", "Equip a quiver or ammo pouch to refill.")
+    end
+    local kind = KINDS[scan.kind]
+    if scan.loading then
+        return SetStatus("loading", "Waiting for the game to load the vendor's ammo.")
+    end
+    if not best then
+        return SetStatus("noammo", ("This vendor sells no %s you can use."):format(kind.noun))
+    end
+    if scan.loadedBetter and db.betterAmmo == "skip" then
+        return SetStatus("better", ("Your %s beat anything sold here."):format(scan.loadedName))
+    end
+    if scan.need <= 0 then
+        return SetStatus("full", ("Your %s has no empty slot."):format(kind.holder))
     end
 
-    local room = money - db.keepCopper
-    if room < 0 then room = 0 end
-    -- A cap of 0 means no cap. Otherwise it is the refill's whole budget.
-    if db.capCopper > 0 then
-        local capped = db.capCopper - shopping.spent
-        if capped < 0 then capped = 0 end
-        if capped < room then room = capped end
+    local need = scan.need - scan.spare
+    local rounds = need > 0 and BuyCount(need, best.batch) or 0
+    if rounds <= 0 then
+        if scan.spare > 0 then
+            return SetStatus("inbags", ("Your bags already hold %d %s. Move them into your %s.")
+                :format(scan.spare, best.name, kind.holder))
+        end
+        return SetStatus("nearlyfull", ("Your %s is nearly full."):format(kind.holder))
     end
 
-    local affordable = math.floor(room / unitPrice)
-    if affordable > wanted then affordable = wanted end
-    return affordable < 0 and 0 or affordable
+    -- Keep gold is never spent; the spending cap is the most one refill spends.
+    local budget = (Number(GetMoney()) or 0) - db.keepCopper
+    local limit = db.keepCopper > 0 and "keep" or "money"
+    if db.capCopper > 0 and db.capCopper < budget then
+        budget, limit = db.capCopper, "cap"
+    end
+    local affordable = AffordableRounds(budget, best)
+    if affordable < rounds then
+        scan.leftOut, scan.limit = rounds - affordable, limit
+        rounds = affordable
+    end
+
+    if rounds <= 0 then
+        if limit == "keep" then
+            return SetStatus("money", ("Not enough money for %d %s while keeping %s.")
+                :format(best.batch, best.name, MoneyText(db.keepCopper)))
+        elseif limit == "cap" then
+            return SetStatus("money", ("The %s spending cap does not cover %d %s.")
+                :format(MoneyText(db.capCopper), best.batch, best.name))
+        end
+        return SetStatus("money", ("Not enough money for %d %s."):format(best.batch, best.name))
+    end
+
+    scan.buyRounds, scan.buyCost = rounds, Cost(rounds, best)
+    return SetStatus("ready", nil)
+end
+
+-- Watches for the items the scan is missing while a vendor is open, and only
+-- then.
+local function WatchItems(frame)
+    if scan.loading then
+        pcall(frame.RegisterEvent, frame, "GET_ITEM_INFO_RECEIVED")
+    else
+        pcall(frame.UnregisterEvent, frame, "GET_ITEM_INFO_RECEIVED")
+    end
+end
+
+local events -- the events frame, made at the end of this file
+
+-- The one place everything is read: the weapon, the quiver, the vendor, the
+-- ammo slot, the need and what a refill would buy, into `scan`.
+local function Evaluate()
+    if not active then return end
+    Wipe(waiting)
+    ReadWeapon()
+    ReadQuivers()
+    -- Without a quiver, the highlight still marks the best ammo for the weapon.
+    ScanVendor(scan.kind or scan.weaponKind)
+    ReadLoadedAmmo()
+    scan.loading = scan.open and not gaveUp and next(waiting) ~= nil
+
+    local best = scan.best
+    scan.slots, scan.emptySlots, scan.rounds = ReadQuiver()
+    scan.need = best and scan.emptySlots * best.stackSize or 0
+    scan.spare = SpareRounds(best and best.itemID)
+
+    PlanPurchase()
+    if scan.open then WatchItems(events) end
 end
 
 --------------------------------------------------------------------------------
--- The count argument
+-- Lines for the tooltip and /ammo status
 --------------------------------------------------------------------------------
--- VERIFY(phase0), answered when the owner pastes the purchase test's output,
--- which the plan's build order asks for. Until then the assumption this
--- block and the stub share:
---
---   (2026-10-17, unverified) BuyMerchantItem's count argument counts single
---   rounds; the vendor prices per round; an amount down to one round can be
---   bought in one purchase. So one purchase buys min(what the need still
---   asks, what the money allows, GetMerchantItemMaxStack) rounds, and
---   BuyCount is given them and returns them. If the game counts vendor
---   bundles instead (a whole stack per purchase, say), this one function
---   changes - the head comment above then records what the game did and on
---   which date.
 
-local function BuyCount(rounds)
-    return rounds
+-- "Medium Quiver, 8 / 10 slots, 1490 arrows": the slots in use, then the
+-- rounds in them. Nil without a quiver.
+local function QuiverLine()
+    if not scan.kind then return nil end
+    return ("%s, %d / %d slots, %d %s"):format(scan.quiverName, scan.slots - scan.emptySlots,
+        scan.slots, scan.rounds, KINDS[scan.kind].noun)
+end
+
+-- "Razor Arrow (level 25)", or nil when the vendor sells nothing that fits.
+local function BestLine()
+    local best = scan.best
+    if not best then return nil end
+    if best.minLevel > 0 then return ("%s (level %d)"):format(best.name, best.minLevel) end
+    return best.name
+end
+
+-- "600 for 1s 50c", or nil when a refill would buy nothing.
+local function RefillLine()
+    if scan.status ~= "ready" then return nil end
+    return ("%d for %s"):format(scan.buyRounds, MoneyText(scan.buyCost))
+end
+
+-- "Your quiver holds arrows but your gun fires bullets.", or nil.
+local function MismatchLine()
+    if not (scan.kind and scan.weaponKind and scan.kind ~= scan.weaponKind) then return nil end
+    local kind = KINDS[scan.kind]
+    return ("Your %s holds %s but your %s fires %s."):format(kind.holder, kind.noun,
+        scan.weaponNoun, KINDS[scan.weaponKind].noun)
+end
+
+-- The ammo slot: "Razor Arrow, 1650", "Empty", or nil when the name is not in.
+local function LoadedLine()
+    if not scan.loadedID then return "Empty" end
+    if not scan.loadedName then return nil end
+    -- The character sheet's ammo count. Seen in game on 2026-10-17: it counts
+    -- the rounds in every bag, as in the 1.x game (1800 with one of nine
+    -- stacks moved out of the quiver, the same as C_Item.GetItemCount).
+    local count = Number(GetInventoryItemCount("player", AMMO_SLOT))
+    if count then return ("%s, %d"):format(scan.loadedName, count) end
+    return scan.loadedName
+end
+
+-- Label and value pairs for /ammo status and the settings page, read fresh.
+local function StatusLines()
+    local lines = {}
+    if not active then
+        lines[1] = { "Status", isHunter and "This client lacks what Fletcher reads." or "Only hunters use ammo." }
+        return lines
+    end
+    Evaluate()
+    lines[#lines + 1] = { "Quiver", QuiverLine() or "No quiver or ammo pouch equipped" }
+    lines[#lines + 1] = { "Ammo slot", LoadedLine() or "Loading" }
+    if scan.open then
+        lines[#lines + 1] = { "Best here", BestLine() or "Nothing that fits" }
+        lines[#lines + 1] = { "Refill", RefillLine() or scan.message or "" }
+    end
+    return lines
 end
 
 --------------------------------------------------------------------------------
 -- The refill, one purchase at a time
 --------------------------------------------------------------------------------
--- The need is fixed when the refill starts; the queue never buys more than
--- what is left of it, whatever bag updates arrive. That is the guard against
--- a buying loop. The next purchase goes when the game says something
--- changed: BAG_UPDATE_DELAYED or MERCHANT_UPDATE (the probe will say which
--- follows a purchase; until then both do). A purchase whose bag update does
--- not come within STEP_TIMEOUT seconds stops the refill. A safety net, not
--- logic.
+-- Never more than the plan made at the start of the refill, whatever the bag
+-- updates say: order.remaining only ever goes down. That is the guard
+-- against a buying loop.
 
--- What the menu and the button tooltip read: rounds and cost a refill would
--- buy and spend now, from the current quiver, best and money, buying
--- nothing. (rounds, cost) with rounds > 0, or nil when nothing to buy.
-local function Preview()
-    if not active then return nil end
-    if quiver.need <= 0 then return nil end
-    local rounds = AffordRounds(quiver.need, best.unitPrice)
-    if rounds <= 0 then return nil end
-    return rounds, math.ceil(rounds * best.unitPrice)
+local function NotifyVendor()
+    if ns.OnScanChanged then ns.OnScanChanged() end
 end
 
--- Done. One line for the chat when it has something to say: how much was
--- bought, what it cost, and where the quiver stands. A refill that was told
--- to stop mid-way says why.
--- Done. The bags are read once more first, so the line says where the
--- quiver stands now, not where it stood when the refill started.
-local function QueueDone(stop, detail)
-    shopping.active = false
-    shopping.waiting = false
-    shopping.pending = 0
-
-    if shopping.kind then
-        ReadQuiver()
-        ScanQuiver(shopping.itemID, quiver.stackSize)
-    end
-
-    if shopping.bought <= 0 then
-        if stop == "error" then
-            Print(("bought nothing: the game refused the purchase (%s).")
-                :format(SafeValue(detail) or "unknown reason"))
-        elseif stop == "timeout" and (shopping.reason == "manual" or db.report) then
-            Print(("bought nothing: no bag update followed the purchase within %d seconds.")
-                :format(STEP_TIMEOUT))
-        end
-        return
-    end
-
-    local line = ("bought %d %s for %s."):format(
-        shopping.bought, KIND_PLURAL[shopping.kind] or "ammo", MoneyText(shopping.spent))
-    if stop == nil then
-        line = line .. (" The quiver now holds %d / %d rounds.")
-            :format(quiver.rounds, quiver.capacity)
-    elseif stop == "money" then
-        line = line .. " Not enough money under the reserve and the cap for more."
-    elseif stop == "reserve" then
-        line = line .. " The keep-gold reserve stopped it."
-    elseif stop == "error" then
-        line = line .. (" The game refused a purchase (%s).")
-            :format(SafeValue(detail) or "unknown reason")
-    elseif stop == "timeout" then
-        line = line .. " No bag update came after a buy, so it stopped."
-    elseif stop == "closed" then
-        line = line .. " The vendor closed."
-    else
-        line = line .. (" The quiver now holds %d / %d rounds.")
-            :format(quiver.rounds, quiver.capacity)
-    end
-    Print(line)
+-- "bought 1400 Razor Arrow for 3s 50c."
+local function BoughtText()
+    return ("bought %d %s for %s."):format(order.bought, order.name, MoneyText(order.spent))
 end
 
--- Stops the refill. Called from the events, from the timer's safety net,
--- from the reserve and from the vendor's closing.
-local function QueueStop(reason, detail)
-    if not shopping.active then return end
-    QueueDone(reason, detail)
+-- "Quiver full (10 / 10 slots)." or "Quiver 8 / 10 slots."
+local function QuiverStateText()
+    local kind = scan.kind and KINDS[scan.kind]
+    if not kind or scan.slots <= 0 then return nil end
+    local used = scan.slots - scan.emptySlots
+    if scan.emptySlots == 0 then
+        return ("%s full (%d / %d slots)."):format(kind.title, used, scan.slots)
+    end
+    return ("%s %d / %d slots."):format(kind.title, used, scan.slots)
 end
 
--- One purchase of the chosen ammo: at most what the need still asks for, at
--- most what one purchase holds, at most what the money under the reserve
--- and the cap allows. Then it waits for the game's own word.
+-- One line in chat when a refill ends. A refill that ran to its end reports
+-- only with Report purchases on; one that was stopped always says why.
+local function ReportRefill(why, detail)
+    local bought = order.bought > 0 and (" " .. (BoughtText():gsub("^b", "B"))) or ""
+    if why == "done" or why == "closed" then
+        if not db.report or order.bought == 0 then return end
+        local text = BoughtText()
+        local state = why == "done" and QuiverStateText()
+        if state then text = text .. " " .. state end
+        if order.leftOut > 0 then text = text .. " " .. LeftOutText(order.leftOut, order.limit) end
+        Print(text)
+    elseif why == "money" then
+        Print(("stopped buying to keep %s.%s"):format(MoneyText(db.keepCopper), bought))
+    elseif why == "error" then
+        local message = type(detail) == "string" and (detail:gsub("%.$", "")) or "the game refused a purchase"
+        Print(("stopped buying: %s.%s"):format(message, bought))
+    elseif why == "timeout" then
+        Print("the vendor did not answer, so buying stopped." .. bought)
+    elseif why == "gone" then
+        Print(("%s is no longer in the vendor's list, so buying stopped.%s"):format(order.name, bought))
+    end
+end
+
+local function FinishRefill(why, detail)
+    if not order.active then return end
+    order.active = false
+    order.asked = 0
+    order.token = order.token + 1 -- the last safety net no longer applies
+    if scan.open then Evaluate() end
+    ReportRefill(why, detail)
+    NotifyVendor()
+end
+
 local function BuyNext()
-    if not (shopping.active and shopping.open) then return end
-    if shopping.left <= 0 then QueueDone(nil) return end
+    if order.remaining <= 0 then return FinishRefill("done") end
 
-    local affordable = AffordRounds(shopping.left, shopping.unitPrice)
-    if affordable <= 0 then
-        -- The money ran out (or fell short of the reserve, or used up the
-        -- cap) mid-refill.
-        QueueDone("money")
-        return
+    -- The money as it is now, with Keep gold still kept.
+    local amount = math.min(order.remaining, order.step)
+    local affordable = AffordableRounds((Number(GetMoney()) or 0) - db.keepCopper, order)
+    if affordable < amount then
+        amount = affordable
+        if amount <= 0 then return FinishRefill("money") end
     end
 
-    local step = affordable
-    local maxPurchase = MaxPurchase(shopping.index)
-    if type(maxPurchase) == "number" and maxPurchase >= 1 and maxPurchase < step then
-        step = maxPurchase
+    -- The list follows the vendor window's filter, so the item may have moved.
+    local index = order.index
+    if Number(GetMerchantItemID(index)) ~= order.itemID then
+        index = FindVendorIndex(order.itemID)
+        if not index then return FinishRefill("gone") end
+        order.index = index
     end
 
-    shopping.pending = step
-    shopping.waiting = true
-    MerchantBuy(shopping.index, BuyCount(step))
-    -- The safety net this one step only: its callback reads the same state,
-    -- and a step that the bag update advanced earlier is already clear.
-    C_Timer.After(STEP_TIMEOUT, function()
-        if shopping.waiting then QueueStop("timeout") end
+    order.countBefore = ItemCount(order.itemID)
+    order.asked = amount
+    order.remaining = order.remaining - amount
+    order.token = order.token + 1
+    local token = order.token
+    BuyMerchantItem(index, amount)
+
+    -- The safety net, not logic: a purchase that never lands stops the refill.
+    C_Timer.After(BUY_TIMEOUT, function()
+        if order.active and order.token == token then FinishRefill("timeout") end
     end)
 end
 
--- A purchase's bag update came in, or the vendor's own stock changed under
--- it: the purchase is retired, and the next one goes. Nothing else advances
--- the refill.
-local function StepDone()
-    if not shopping.waiting then return end
-    shopping.waiting = false
-    shopping.bought = shopping.bought + shopping.pending
-    shopping.spent = shopping.spent + Round(shopping.pending * (shopping.unitPrice or 0))
-    shopping.left = shopping.left - shopping.pending
-    shopping.pending = 0
-    if shopping.left <= 0 then
-        QueueDone(nil)
-    else
-        BuyNext()
-    end
-end
-
---------------------------------------------------------------------------------
--- The vendor visit
---------------------------------------------------------------------------------
-
--- The refill and the visit's refresh, and the events frame, all
--- forward-declared: they call each other in both directions.
-local Refill
-local events
-
--- Everything the visit draws on, read in the order the logic needs it: the
--- bag first (its kind decides, down to the weapon's kind without one), then
--- the weapon to warn against, then the best of the kind the vendor sells,
--- and then the quiver's numbers by the best item's own stack.
-UpdateVisit = function()
-    if not shopping.open then return end
-
-    ReadQuiver()
-    ReadRanged()
-    if quiver.present and ranged.shoots and quiver.kind ~= ranged.shoots then
-        if not warnedMismatch then
-            warnedMismatch = true
-            Print(("your quiver holds %s and your weapon does not shoot them; you may want a %s bag.")
-                :format(KIND_PLURAL[quiver.kind] or "ammo",
-                    quiver.kind == SUBCLASS_ARROW and "bullet" or "arrow"))
-        end
-    end
-
-    local kind = quiver.kind or ranged.shoots
-    SearchBest(kind)
-    if best.found and best.stackSize then
-        ScanQuiver(best.itemID, best.stackSize)
-    else
-        quiver.need = 0
-    end
-
-    -- The visit's own wait state: while the search waits for an item's
-    -- details, GET_ITEM_INFO_RECEIVED is enrolled, and a deferred auto
-    -- buy is remembered, because the event that clears the wait is what
-    -- brings the purchase back. Three tries, and the visit goes on with
-    -- what is cached.
-    if infoTries >= MAX_INFO_TRIES then best.waiting = false end
-    if best.waiting then
-        if not shopping.watchingInfo then
-            shopping.watchingInfo = true
-            pcall(events.RegisterEvent, events, "GET_ITEM_INFO_RECEIVED")
-        end
-    elseif shopping.watchingInfo then
-        shopping.watchingInfo = false
-        pcall(events.UnregisterEvent, events, "GET_ITEM_INFO_RECEIVED")
-    end
-end
-
-local function MaybeAutoBuy()
-    if not db.autoBuy then return end
-    if IsShiftKeyDown() then return end -- hold Shift to open a vendor without buying
-    Refill("auto")
-end
-
--- reason is "auto" or "manual"; a manual refill reports whatever it does,
--- since the hunter asked for it, while the auto one only speaks when the
--- Report setting is on. One refill at a time; a second call is ignored.
-function Refill(reason)
-    if not active then return end
-    if not shopping.open then
-        if reason == "manual" then
-            Print("open a vendor that sells ammo to refill.")
-        end
-        return
-    end
-    if shopping.active then return end
-
-    UpdateVisit()
-    if not quiver.present then
-        if reason == "manual" then
-            Print("equip a quiver or ammo pouch to refill.")
-        end
-        return
-    end
-    if best.waiting then
-        -- An item's details are still on their way: the visit waits, and
-        -- the item info event brings the purchase back. Its handler only
-        -- retries the auto buy, so a manual refill waits for another
-        -- click or for the event itself.
-        if reason == "auto" then shopping.autoWanted = true end
-        return
-    end
-    if not best.found then
-        if reason == "manual" or db.report then
-            Print(("the vendor sells no %s you can use."):format(
-                KIND_PLURAL[quiver.kind] or "ammo"))
-        end
-        return
-    end
-    if quiver.need <= 0 then
-        -- Full already: the button's tooltip says so, and nothing bought.
-        return
-    end
-
-    local affordable = AffordRounds(quiver.need, best.unitPrice)
-    if affordable <= 0 then
-        -- Not even one round under the reserve and the cap: say so and
-        -- leave the queue out of it.
-        if reason == "manual" or db.report then
-            Print(("bought nothing: %d %s would cost %s and you have %s.")
-                :format(quiver.need, KIND_PLURAL[quiver.kind] or "ammo",
-                    MoneyText(math.ceil(quiver.need * best.unitPrice)),
-                    MoneyText(PlayerMoney() or 0)))
-        end
-        return
-    end
-
-    shopping.reason = reason
-    shopping.kind = quiver.kind
-    shopping.index = best.index
-    shopping.itemID = best.itemID
-    shopping.name = best.name
-    shopping.unitPrice = best.unitPrice
-    -- The need is fixed now. The steps take what the money, the reserve and
-    -- the cap allow of it, purchase by purchase.
-    shopping.left = quiver.need
-    shopping.bought = 0
-    shopping.spent = 0
-    shopping.pending = 0
-    shopping.waiting = false
-    shopping.active = true
-
+-- BAG_UPDATE_DELAYED during a refill: the purchase in flight has landed when
+-- the item's count went up. A bag update from anything else is waited out.
+local function OnPurchaseLanded()
+    if not (order.active and order.asked > 0) then return end
+    local now = ItemCount(order.itemID)
+    if order.countBefore and now and now <= order.countBefore then return end
+    order.bought = order.bought + order.asked
+    order.spent = order.spent + Cost(order.asked, order)
+    order.asked = 0
     BuyNext()
 end
 
+-- Starts a refill from what Evaluate reads right now. Manual is a click on the
+-- vendor button, /ammo refill or the menu; anything else is the auto buy,
+-- which keeps quiet about why it bought nothing, money aside.
+local function Refill(manual)
+    if not active then
+        if manual then
+            Print(isHunter and "this client lacks what Fletcher reads, so it cannot buy."
+                or "only hunters use ammo.")
+        end
+        return false
+    end
+    if not scan.open then
+        if manual then Print("talk to a vendor that sells ammo first.") end
+        return false
+    end
+    if order.active then return false end
+    if manual then autoPending = false end
+
+    Evaluate()
+    if scan.status == "loading" then
+        if manual then
+            manualPending = true
+            Print("waiting for the game to load the vendor's ammo; Fletcher buys as soon as it has.")
+        end
+        return false
+    end
+    if scan.status ~= "ready" then
+        if manual or (scan.status == "money" and db.report) then Print(ChatLine(scan.message)) end
+        NotifyVendor()
+        return false
+    end
+
+    local best = scan.best
+    order.active = true
+    order.itemID, order.name, order.index = best.itemID, best.name, best.index
+    order.price, order.batch, order.step = best.price, best.batch, StepRounds(best)
+    order.remaining = scan.buyRounds
+    order.asked, order.countBefore = 0, nil
+    order.bought, order.spent = 0, 0
+    order.leftOut, order.limit = scan.leftOut, scan.limit
+    BuyNext()
+    NotifyVendor()
+    return true
+end
+
+-- The auto buy runs once per vendor visit, as soon as the vendor's list and
+-- the items in it are in.
+local function TryAuto()
+    if not autoPending or order.active then return end
+    local count = Number(GetMerchantNumItems())
+    if not count or count == 0 then return end -- MERCHANT_UPDATE brings the list
+    if scan.loading then return end            -- GET_ITEM_INFO_RECEIVED brings the items
+    autoPending = false
+    Refill(false)
+end
+
+-- Says once per visit, at a vendor that sells ammo, that the quiver and the
+-- weapon disagree. The bag still decides what is bought.
+local function WarnMismatch()
+    if warned or not scan.sellsAmmo then return end
+    local line = MismatchLine()
+    if not line then return end
+    warned = true
+    Print(ChatLine(line))
+end
+
+-- After anything at an open vendor that may change what is read.
+local function Update()
+    Evaluate()
+    WarnMismatch()
+    TryAuto()
+    NotifyVendor()
+end
+
+-- An item the scan was missing came in, or came back still missing. After
+-- MAX_ITEM_TRIES of those, Fletcher stops waiting for this visit, and a
+-- refill that was waiting is dropped.
+local function OnItemInfo(itemID)
+    itemID = Number(itemID)
+    if not (itemID and waiting[itemID]) then return end
+    Evaluate()
+    if waiting[itemID] then
+        itemTries = itemTries + 1
+        if itemTries >= MAX_ITEM_TRIES then
+            gaveUp = true
+            if autoPending or manualPending then
+                Print("the game did not load the vendor's ammo, so nothing was bought.")
+            end
+            autoPending, manualPending = false, false
+            Evaluate()
+        end
+    end
+    if manualPending and not scan.loading then
+        manualPending = false
+        Refill(true)
+    end
+    Update()
+end
+
 --------------------------------------------------------------------------------
--- Settings
+-- Changing settings
 --------------------------------------------------------------------------------
--- Every setter applies at once and tells the settings page (if it is open)
--- and the vendor window (if one is), so the three places that set a setting
--- can never disagree.
+-- Every setter changes the saved value and tells the settings page and the
+-- vendor window, which redraw only while they are showing.
 
 local function NotifyChanged()
     if ns.OnSettingsChanged then ns.OnSettingsChanged() end
-    if ns.OnVendorChanged then ns.OnVendorChanged() end
+    -- Keep gold, the cap and the better ammo choice change what a refill buys.
+    if scan.open then Evaluate() end
+    NotifyVendor()
 end
 
 local function SetAutoBuy(on)
@@ -1038,7 +1098,6 @@ end
 
 local function SetPulse(on)
     db.pulse = on and true or false
-    if not db.pulse and ns.OnVendorChanged then ns.OnVendorChanged() end
     NotifyChanged()
 end
 
@@ -1052,100 +1111,28 @@ local function SetShowButton(on)
     NotifyChanged()
 end
 
--- The money settings arrive in gold from the slash command and in copper
--- from the menu and the settings page; they are held in copper. Anything
--- else, and a negative number, is refused; the settings' top is MAX_GOLD.
 local function SetKeepCopper(copper)
-    copper = FixCopper(copper)
-    if copper == nil then return end
-    db.keepCopper = copper
+    db.keepCopper = ValidCopper(copper)
     NotifyChanged()
 end
 
 local function SetCapCopper(copper)
-    copper = FixCopper(copper)
-    if copper == nil then return end
-    db.capCopper = copper
+    db.capCopper = ValidCopper(copper)
     NotifyChanged()
 end
 
-local function SetKeepGold(gold)
-    gold = SafeNumber(gold)
-    if gold ~= nil then SetKeepCopper(Round(gold * COPPER_PER_GOLD)) end
+local function SetBetterAmmo(key)
+    if not KnownBetter(key) then return end
+    db.betterAmmo = key
+    NotifyChanged()
 end
 
-local function SetCapGold(gold)
-    gold = SafeNumber(gold)
-    if gold ~= nil then SetCapCopper(Round(gold * COPPER_PER_GOLD)) end
-end
-
+-- The settings page's Defaults and /ammo reset: every setting back to how a
+-- fresh install has it.
 local function ResetDefaults()
-    for key, value in pairs(DEFAULTS) do
-        db[key] = value
-    end
+    for key, value in pairs(DEFAULTS) do db[key] = value end
     NotifyChanged()
 end
-
---------------------------------------------------------------------------------
--- The status lines
---------------------------------------------------------------------------------
-
--- What the settings page's Status section says. One reused table of strings,
--- refreshed on every show of the page.
-local status = {}
-
-local function RefreshStatus()
-    ReadQuiver()
-    local itemID, ammoCount = ReadAmmoSlot()
-
-    if quiver.present then
-        status.quiver = quiver.name and (quiver.name .. " (bag " .. (quiver.bags[1] or "?") .. ")")
-            or "a quiver or ammo pouch"
-        status.kind = KIND_PLURAL[quiver.kind] and ("holds " .. KIND_PLURAL[quiver.kind]) or "unknown"
-        if quiver.capacity > 0 and quiver.stackSize then
-            status.rounds = ("%d / %d rounds"):format(quiver.rounds, quiver.capacity)
-        else
-            status.rounds = ("%d rounds"):format(quiver.rounds)
-        end
-    else
-        status.quiver = "none equipped"
-        status.kind = "-"
-        status.rounds = "-"
-    end
-
-    if type(itemID) == "number" then
-        local data = ItemInfo(itemID)
-        local name = data and data.name or ("item " .. itemID)
-        status.ammoSlot = ("%s x %s"):format(name,
-            type(ammoCount) == "number" and ammoCount or "?")
-    else
-        status.ammoSlot = "empty"
-    end
-    return status
-end
-
---------------------------------------------------------------------------------
--- Slash command
---------------------------------------------------------------------------------
-
-local HELP = {
-    "/ammo - open the settings page (also under Options, AddOns)",
-    "/ammo status - the quiver, its rounds, and the best ammo at an open vendor",
-    "/ammo refill - fill the quiver now (a vendor must be open)",
-    "/ammo auto on | off - buy on opening a vendor that sells ammo",
-    "/ammo highlight on | off - the gold border on the best ammo",
-    "/ammo others on | off - the green border on the other usable ammo",
-    "/ammo pulse on | off - the highlight's gentle pulse",
-    "/ammo report on | off - one chat line when a refill is done",
-    "/ammo button on | off - the vendor button in the vendor window",
-    "/ammo keep <gold> - never spend below this, for example 1 or 0.5",
-    "/ammo cap <gold> - the most one refill may spend; 0 for no cap",
-    "/ammo reset - every setting back to how a fresh install has it",
-    "Right-click the vendor button for the same options.",
-}
-
--- Commands that only show something, so they need no hunter to make sense.
-local SHOW_COMMANDS = { [""] = true, help = true, options = true, config = true, settings = true }
 
 -- The settings page lives in Fletcher_Options.lua, which sets ns.OpenSettings.
 local function OpenSettings()
@@ -1154,23 +1141,56 @@ local function OpenSettings()
     end
 end
 
--- /.ammo auto on | off, and the same shape for every boolean setting: they
--- all go through the setters in ns.API.
-local TOGGLES = {
-    { command = "auto",      setter = SetAutoBuy,        key = "autoBuy" },
-    { command = "highlight", setter = SetHighlight,      key = "highlight" },
-    { command = "others",    setter = SetHighlightOther, key = "highlightOther" },
-    { command = "pulse",     setter = SetPulse,          key = "pulse" },
-    { command = "report",    setter = SetReport,         key = "report" },
-    { command = "button",    setter = SetShowButton,     key = "showButton" },
+--------------------------------------------------------------------------------
+-- Slash command
+--------------------------------------------------------------------------------
+
+local HELP = {
+    "/ammo - open the settings page (also under Options, AddOns)",
+    "/ammo help - list these commands",
+    "/ammo status - your quiver, its rounds, and the best ammo at the open vendor",
+    "/ammo refill - fill the quiver now (talk to a vendor first)",
+    "/ammo auto on | off - buy when you talk to a vendor that sells your ammo",
+    "/ammo highlight on | off - mark the best ammo in the vendor window",
+    "/ammo others on | off - mark the other ammo you can use, in green",
+    "/ammo pulse on | off - the proc glow on the best ammo, or a still glow",
+    "/ammo report on | off - say in chat what was bought",
+    "/ammo button on | off - the Fletcher button in the vendor window",
+    "/ammo keep <gold> - money a refill never touches, for example 1, 0.5 or 0",
+    "/ammo cap <gold> - the most one refill spends, 0 for no cap",
+    "/ammo better skip | fill - when your loaded ammo beats the vendor's",
+    "/ammo reset - every setting back to its default",
+    "Right-click the Fletcher button in the vendor window for the same options.",
 }
 
--- A gold number from a typed word: "1", "0.5", "10.25". nil for anything
--- else.
-local function ParseGold(word)
-    local number = word and tonumber(word:match("^(%d+%.?%d*)$") or "")
-    if number == nil then return nil end
-    return number
+-- The on and off commands: the setting, its setter and what to say.
+local SWITCHES = {
+    auto = { key = "autoBuy", set = SetAutoBuy,
+        on = "auto buy on: talking to a vendor that sells your ammo fills the quiver.",
+        off = "auto buy off: click the Fletcher button in the vendor window to refill." },
+    highlight = { key = "highlight", set = SetHighlight,
+        on = "the best ammo is marked in the vendor window.",
+        off = "the best ammo is no longer marked." },
+    others = { key = "highlightOther", set = SetHighlightOther,
+        on = "the other ammo you can use is marked in green.",
+        off = "only the best ammo is marked." },
+    pulse = { key = "pulse", set = SetPulse,
+        on = "the best ammo gets the proc glow.",
+        off = "the best ammo keeps a still gold glow." },
+    report = { key = "report", set = SetReport,
+        on = "purchases are reported in chat.",
+        off = "purchases are no longer reported in chat." },
+    button = { key = "showButton", set = SetShowButton,
+        on = "the Fletcher button shows in the vendor window.",
+        off = "the Fletcher button is hidden; /ammo refill still refills." },
+}
+
+local function PrintStatus()
+    local lines = StatusLines()
+    Print("your ammo:")
+    for _, line in ipairs(lines) do
+        print(("  %s: %s"):format(line[1], line[2]))
+    end
 end
 
 SLASH_FLETCHER1 = "/fletcher"
@@ -1179,152 +1199,139 @@ SlashCmdList["FLETCHER"] = function(msg)
     if not db then return end -- before PLAYER_LOGIN
 
     local command, word = strtrim(msg or ""):lower():match("^(%S*)%s*(.-)$")
-
-    if not SHOW_COMMANDS[command] and not active then
-        Print(isHunter and "this client has no ammo to fetch, so there is nothing to refill."
-            or "only a hunter carries a quiver, so there is nothing to refill on this character.")
-    end
+    local switch = SWITCHES[command]
 
     if command == "" or command == "options" or command == "config" or command == "settings" then
         OpenSettings()
-    elseif command == "help" then
-        Print("a quiver refill, for hunting.")
-        for _, line in ipairs(HELP) do print("  " .. line) end
+    elseif command == "status" then
+        PrintStatus()
     elseif command == "refill" then
-        Refill("manual")
-    elseif command == "keep" then
-        local gold = ParseGold(word)
-        if gold then
-            SetKeepGold(gold)
-            Print(("keeping %s on you."):format(MoneyText(db.keepCopper)))
+        Refill(true)
+    elseif switch then
+        if word == "on" or word == "off" then
+            switch.set(word == "on")
+            Print(db[switch.key] and switch.on or switch.off)
         else
-            Print("give a gold amount, for example /ammo keep 1 or /ammo keep 0.5, or 0 to spend it all.")
+            Print(("use /ammo %s on or /ammo %s off."):format(command, command))
         end
-    elseif command == "cap" then
-        local gold = ParseGold(word)
-        if gold then
-            SetCapGold(gold)
-            if db.capCopper == 0 then
-                Print("the spending cap is off.")
-            else
-                Print(("one refill may spend at most %s."):format(MoneyText(db.capCopper)))
-            end
+    elseif command == "keep" or command == "cap" then
+        local copper = ParseGold(word)
+        if command == "keep" and copper then
+            SetKeepCopper(copper)
+            Print(db.keepCopper > 0 and ("a refill always leaves you %s."):format(MoneyText(db.keepCopper))
+                or "a refill may spend all your money.")
+        elseif copper then
+            SetCapCopper(copper)
+            Print(db.capCopper > 0 and ("one refill spends at most %s."):format(MoneyText(db.capCopper))
+                or "a refill spends what filling the quiver costs, with no cap.")
         else
-            Print("give a gold amount, for example /ammo cap 1, or 0 for no cap.")
+            Print(("give an amount of gold, for example /ammo %s 1 or /ammo %s 0.5."):format(command, command))
+        end
+    elseif command == "better" then
+        if KnownBetter(word) then
+            SetBetterAmmo(word)
+            Print(word == "skip" and "when your loaded ammo beats the vendor's, nothing is bought."
+                or "when your loaded ammo beats the vendor's, only the empty slots are filled.")
+        else
+            Print("use /ammo better skip or /ammo better fill.")
         end
     elseif command == "reset" then
         ResetDefaults()
-        Print("every setting is back to how a fresh install has it.")
+        Print("every setting is back to its default.")
     else
-        local toggle
-        for _, entry in ipairs(TOGGLES) do
-            if entry.command == command then toggle = entry end
-        end
-        if toggle then
-            if word == "on" or word == "off" then
-                toggle.setter(word == "on")
-                Print(("%s %s."):format(
-                    toggle.command, db[toggle.key] and "on" or "off"))
-            else
-                Print(("/%s %s on or /%s %s off."):format(
-                    "fletcher", toggle.command, "fletcher", toggle.command))
-            end
-        else
-            Print("a quiver refill, for hunting.")
-            for _, line in ipairs(HELP) do print("  " .. line) end
-        end
+        Print("fills your quiver or ammo pouch at the vendor.")
+        for _, line in ipairs(HELP) do print("  " .. line) end
     end
 end
 
 --------------------------------------------------------------------------------
--- For the settings page and the vendor window
+-- For the vendor window and the settings page
 --------------------------------------------------------------------------------
--- Fletcher_Options.lua builds its page from these, and Fletcher_Vendor.lua
--- draws from them, so the page, the right-click menu, the slash commands and
--- the vendor window can never disagree.
+-- Fletcher_Vendor.lua and Fletcher_Options.lua build on these, so the menu,
+-- the page and the slash commands all change a setting through the same
+-- setter.
 
 ns.API = {
     Version = VERSION, -- nil when the toc names none
     GetDB = function() return db end,
     Print = Print,
-    MoneyText = MoneyText,
-    SafeValue = SafeValue,
+    IsActive = function() return active end,
+    IsBuying = function() return order.active end,
 
-    -- Settings: every control goes through these.
+    Refill = function() return Refill(true) end,
+    QuiverLine = QuiverLine,
+    BestLine = BestLine,
+    RefillLine = RefillLine,
+    MismatchLine = MismatchLine,
+    LeftOutText = LeftOutText,
+    StatusLines = StatusLines,
+    MoneyText = MoneyText,
+    GoldText = GoldText,
+    ParseGold = ParseGold,
+    OpenSettings = OpenSettings,
+
     SetAutoBuy = SetAutoBuy,
     SetHighlight = SetHighlight,
     SetHighlightOther = SetHighlightOther,
     SetPulse = SetPulse,
     SetReport = SetReport,
     SetShowButton = SetShowButton,
-    SetKeepGold = SetKeepGold,
-    SetCapGold = SetCapGold,
     SetKeepCopper = SetKeepCopper,
     SetCapCopper = SetCapCopper,
+    SetBetterAmmo = SetBetterAmmo,
     ResetDefaults = ResetDefaults,
-    MAX_GOLD = MAX_GOLD,
 
-    -- "arrows" or "bullets", or "ammo" past the two kinds.
-    KindPlural = function(kind) return KIND_PLURAL[kind] or "ammo" end,
-    KindSingular = function(kind) return KIND_SINGULAR[kind] or "ammo" end,
-
-    -- The money amounts the menu offers.
-    KeepChoices = function() return KEEP_CHOICES end,
-    CapChoices = function() return CAP_CHOICES end,
-
-    -- The reads the vendor window and the status section draw from. All of
-    -- them are reused tables: read-only as far as the callers go.
-    Quiver = function() return quiver end,
-    Ranged = function() return ranged end,
-    Best = function() return best end,
-    VendorOpen = function() return shopping.open end,
-
-    -- What a refill would do now, buying nothing: (rounds, cost) or nil.
-    Preview = Preview,
-
-    -- The status section's lines, refreshed when it is asked for.
-    Status = RefreshStatus,
-
-    -- Actions.
-    Refill = Refill,
+    KEEP_PRESETS = KEEP_PRESETS,
+    CAP_PRESETS = CAP_PRESETS,
+    BETTER_CHOICES = BETTER_CHOICES,
+    COPPER_PER_GOLD = COPPER_PER_GOLD,
+    MAX_COPPER = MAX_COPPER,
+    DEFAULT_ICON = DEFAULT_ICON,
+    LABEL_COLOR = LABEL_COLOR,
+    HINT_COLOR = HINT_COLOR,
 }
-
--- The vendor's highlight and button, in Fletcher_Vendor.lua. Called by the
--- setters too, so a setting shows up in an open vendor window at once.
-function ns.OnVendorChanged()
-    if ns.VendorRefresh then ns.VendorRefresh() end
-end
-
-function ns.VendorOpened()
-    if ns.VendorShow then ns.VendorShow() end
-end
-
-function ns.VendorClosed()
-    if ns.VendorHide then ns.VendorHide() end
-end
 
 --------------------------------------------------------------------------------
 -- Events
 --------------------------------------------------------------------------------
--- What is listened to, and at what cost:
---   at load:            PLAYER_LOGIN, and nothing else;
---   at login:           MERCHANT_SHOW and MERCHANT_CLOSED for a hunter;
---   while a vendor is:  MERCHANT_UPDATE, BAG_UPDATE_DELAYED,
---                       PLAYER_MONEY and UI_ERROR_MESSAGE, registered when
---                       it opens and dropped when it closes;
---   while waiting:      GET_ITEM_INFO_RECEIVED, registered when the search
---                       waits for the client's cache, dropped when it stops.
--- Every registration through pcall: an event the client does not have would
--- otherwise stop the rest.
 
-local VENDOR_EVENTS = { "MERCHANT_SHOW", "MERCHANT_CLOSED" }
-
-local IN_VENDOR_EVENTS = {
+-- What a hunter listens to while a vendor is open, and only then. Each is
+-- registered through pcall: registering an event the client does not have
+-- raises an error, and one missing event must not stop the rest.
+local VENDOR_EVENTS = {
     "MERCHANT_UPDATE",
+    "MERCHANT_FILTER_ITEM_UPDATE",
     "BAG_UPDATE_DELAYED",
-    "PLAYER_MONEY",
     "UI_ERROR_MESSAGE",
+    "PLAYER_MONEY",
 }
+
+local function OnVendorShow()
+    scan.open = true
+    warned, itemTries, gaveUp, manualPending = false, 0, false, false
+    for _, name in ipairs(VENDOR_EVENTS) do
+        pcall(events.RegisterEvent, events, name)
+    end
+    if ns.BuildVendorUI then ns.BuildVendorUI() end
+    -- Holding Shift while talking to the vendor skips the auto buy.
+    autoPending = db.autoBuy and not Bool(IsShiftKeyDown())
+    Update()
+end
+
+local function OnVendorClosed()
+    if not scan.open then return end
+    scan.open = false
+    FinishRefill("closed")
+    autoPending, manualPending = false, false
+    for _, name in ipairs(VENDOR_EVENTS) do
+        pcall(events.UnregisterEvent, events, name)
+    end
+    pcall(events.UnregisterEvent, events, "GET_ITEM_INFO_RECEIVED")
+    Wipe(waiting)
+    scan.best, scan.loading = nil, false
+    Wipe(scan.others)
+    NotifyVendor()
+end
 
 events = CreateFrame("Frame")
 events:RegisterEvent("PLAYER_LOGIN")
@@ -1333,90 +1340,43 @@ events:SetScript("OnEvent", function(self, event, ...)
         self:UnregisterEvent("PLAYER_LOGIN")
         InitDB()
 
-        -- The settings page, for every character: the settings are
-        -- account-wide, so they can be set up from any of them.
+        -- The settings page, for every character: the settings are account
+        -- wide, so they can be set up from any of them.
         if ns.InstallSettings then ns.InstallSettings() end
 
         local _, classFile = UnitClass("player")
         isHunter = SafeValue(classFile) == "HUNTER"
         if not isHunter then return end
 
-        active = true
-        for _, name in ipairs(VENDOR_EVENTS) do
-            pcall(self.RegisterEvent, self, name)
+        local missing = MissingAPI() or (not ReadEnums() and "Enum.ItemClass")
+        if missing then
+            Print(("this client has no %s, so Fletcher stays off."):format(missing))
+            return
         end
+        lastBag = Number(NUM_BAG_SLOTS) or DEFAULT_BAG_SLOTS
+
+        active = true
+        pcall(self.RegisterEvent, self, "MERCHANT_SHOW")
+        pcall(self.RegisterEvent, self, "MERCHANT_CLOSED")
         return
     end
 
     if event == "MERCHANT_SHOW" then
-        for _, name in ipairs(IN_VENDOR_EVENTS) do
-            pcall(self.RegisterEvent, self, name)
-        end
-        infoTries = 0
-        warnedMismatch = false
-        shopping.open = true
-        shopping.autoWanted = false
-
-        -- The visit reads first, then the vendor window's parts draw from
-        -- what it read, and then the auto buy has its own go.
-        UpdateVisit()
-        if ns.OnVendorChanged then ns.OnVendorChanged() end
-        MaybeAutoBuy()
-    elseif event == "MERCHANT_UPDATE" then
-        -- The vendor's own stock changed. A purchase that was out is
-        -- retired, if the probe says MERCHANT_UPDATE is the event a
-        -- purchase is followed by; until then both this and
-        -- BAG_UPDATE_DELAYED do, and the queue's own counter keeps the
-        -- total inside the need it started with.
-        if shopping.waiting then StepDone() end
-        UpdateVisit()
-        if ns.OnVendorChanged then ns.OnVendorChanged() end
-    elseif event == "BAG_UPDATE_DELAYED" then
-        if shopping.waiting then StepDone() end
-        UpdateVisit()
-        if ns.OnVendorChanged then ns.OnVendorChanged() end
+        OnVendorShow()
     elseif event == "MERCHANT_CLOSED" then
-        -- The vendor's events go, a refill stops with the window, and the
-        -- vendor window's own parts are hidden until the next one opens.
-        for _, name in ipairs(IN_VENDOR_EVENTS) do
-            pcall(self.UnregisterEvent, self, name)
-        end
-        if shopping.open and shopping.waiting then
-            -- The purchase never finished: say so honestly, as bought
-            -- nothing, unless something was bought already.
-            shopping.waiting = false
-        end
-        shopping.open = false
-        shopping.autoWanted = false
-        if shopping.active then QueueStop("closed") end
-        if ns.VendorClosed then ns.VendorClosed() end
-    elseif event == "PLAYER_MONEY" then
-        if shopping.active and shopping.left > 0 then
-            local money = PlayerMoney()
-            if money ~= nil and money < db.keepCopper then
-                QueueStop("reserve")
-            end
-        end
+        OnVendorClosed()
+    elseif not scan.open then
+        return
+    elseif event == "BAG_UPDATE_DELAYED" then
+        OnPurchaseLanded()
+        Update()
     elseif event == "UI_ERROR_MESSAGE" then
-        -- The game refused something. While a purchase is out, that is
-        -- about the purchase (the bags are full, the money is not enough),
-        -- and the refill stops with what the game said.
-        if shopping.waiting then
-            local detail = SafeValue(select(1, ...))
-            if type(detail) ~= "string" then detail = SafeValue(select(2, ...)) end
-            QueueStop("error", detail)
-        end
+        local _, message = ...
+        FinishRefill("error", SafeValue(message))
     elseif event == "GET_ITEM_INFO_RECEIVED" then
-        if not (shopping.open and shopping.watchingInfo) then return end
-        infoTries = infoTries + 1
-        if infoTries >= MAX_INFO_TRIES then
-            -- Three goes: the visit goes on with what was cached.
-            shopping.watchingInfo = false
-            pcall(self.UnregisterEvent, self, "GET_ITEM_INFO_RECEIVED")
-        end
-        UpdateVisit()
-        if shopping.autoWanted and not IsShiftKeyDown() then
-            Refill("auto")
-        end
+        OnItemInfo((...))
+    else
+        -- MERCHANT_UPDATE, MERCHANT_FILTER_ITEM_UPDATE and PLAYER_MONEY.
+        Update()
     end
 end)

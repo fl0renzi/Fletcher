@@ -1,16 +1,17 @@
 -- Fletcher - Fletcher_Options.lua
--- The settings page, under Options > AddOns > Fletcher, drawn the way the
--- game's own settings list is: the title in a header strip with a Defaults
--- button and the divider under it, section headings, then rows with the label
--- on the left and the control from the middle. Every control goes through the
--- same setters in ns.API as the right-click menu and the slash commands, so
--- the three can never disagree.
+-- The settings page, under Options > AddOns > Fletcher, laid out the way
+-- BeastXP's is and the game's own settings list is: the title in a header
+-- strip with a Defaults button and the divider under it, section headings,
+-- then rows with the label on the left and the control from the middle.
+-- Every control goes through the same setters as the right-click menu and the
+-- slash commands (ns.API, in Fletcher.lua), so the three can never disagree.
 --
--- A canvas page (Settings.RegisterCanvasLayoutCategory), not a vertical list,
--- and every frame made at login while the page is hidden, as BeastXP's is:
--- the game's settings search reads the rows of every vertical list, and a
--- page built while the settings window is open carries an addon's taint into
--- Blizzard's own rows. The controls are the client's own templates.
+-- A canvas page (Settings.RegisterCanvasLayoutCategory), not a vertical list:
+-- the game's settings search reads the rows of every vertical list, and
+-- ItemTree found that carries an addon's taint into Blizzard's own rows. And
+-- every frame is made at login while the page is hidden, never while the
+-- settings window is open. The controls are the client's own templates, the
+-- ones BeastXP's page already uses on Forever.
 
 local addonName, ns = ...
 if not ns.Allowed then return end
@@ -19,8 +20,7 @@ local API = ns.API
 
 local PAGE_TITLE = "Fletcher"
 
--- The settings list's own measurements, the same numbers BeastXP's page is
--- drawn with, as ItemTree takes them from Blizzard_SettingsList: the title at
+-- The settings list's own measurements, as BeastXP takes them: the title at
 -- 7, -22 in a 50 tall header strip, the Defaults button 96 by 22 at -36, -16
 -- from the top right, rows 26 tall with 9 between them, the label 37 in, the
 -- control from 80 left of the middle.
@@ -35,14 +35,26 @@ local LABEL_X = 37
 local CONTROL_X = -80
 
 -- Under the header the page scrolls, since its rows can be taller than the
--- settings window leaves room for. The client's scroll bar sits 6 to the
--- right of the scrolling area and is 8 wide.
+-- settings window leaves room for.
 local SCROLL_TOP = HEADER_HEIGHT + 2
 local SCROLL_RIGHT = -24
 local SCROLL_BOTTOM = 4
 
+local DROPDOWN_WIDTH = 220
 local SLIDER_WIDTH = 250
-local NUMBER_BOX_WIDTH = 52
+local GOLD_BOX_WIDTH = 64
+local GOLD_BOX_LETTERS = 8
+
+-- How far the gold sliders reach. A typed amount may go past them, up to
+-- what the setters take.
+local KEEP_SLIDER_MAX = 100
+local CAP_SLIDER_MAX = 50
+
+-- The status rows, in order, by the labels API.StatusLines gives. Only what
+-- reads away from a vendor: the game closes the vendor window when the
+-- settings window opens, so the vendor's own lines would never show here.
+local STATUS_ROWS = { "Quiver", "Ammo slot" }
+local VENDOR_HINT = "At a vendor, hover the Fletcher button for the best ammo there and what a refill buys, or type /ammo status."
 
 local page            -- the canvas frame, built at login
 local content         -- the scrolling part of the page, under the header
@@ -85,18 +97,6 @@ local function Row(text, height)
     return row
 end
 
--- A status row: one line, all of it text, refreshed from API.Status() on
--- every show of the page and at every setting change. Nothing here goes
--- through a control, so there is nothing to refresh a control with.
-local function TextRow()
-    local row = NextRow(ROW_HEIGHT)
-    local text = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    text:SetPoint("LEFT", LABEL_X, 0)
-    text:SetJustifyH("LEFT")
-    text:SetWordWrap(false)
-    return text
-end
-
 local function Tooltip(widget, text)
     widget:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -116,27 +116,14 @@ local function Checkbox(row, onClick)
     return check
 end
 
-local function WholeNumber(value)
-    return ("%d"):format(math.floor(value + 0.5))
-end
-
--- Gold, shown the way the slash command takes it: 0.5 for half a gold.
-local function GoldText(value)
-    return ("%g"):format(value)
-end
-
--- The client's stepper slider, whole numbers only, with the value on its
--- right unless a NumberBox shows it there instead. Its change callback is the
--- one Baganator reads on Forever.
-local function Slider(row, minimum, maximum, onChange, withBox)
+-- The client's stepper slider, whole gold only; the box beside it shows the
+-- exact amount. Its change callback is the one BeastXP reads on Forever.
+local function Slider(row, minimum, maximum, onChange)
     local slider = CreateFrame("Slider", nil, row, "MinimalSliderWithSteppersTemplate")
     slider:SetPoint("LEFT", row, "CENTER", CONTROL_X, 0)
     slider:SetWidth(SLIDER_WIDTH)
     slider:SetHeight(20)
-    slider:Init(minimum, minimum, maximum, maximum - minimum, not withBox and {
-        [MinimalSliderWithSteppersMixin.Label.Right] = CreateMinimalSliderFormatter(
-            MinimalSliderWithSteppersMixin.Label.Right, WholeNumber),
-    } or nil)
+    slider:Init(minimum, minimum, maximum, maximum - minimum, nil)
     slider:RegisterCallback(MinimalSliderWithSteppersMixin.Event.OnValueChanged, function(_, value)
         if refreshing then return end
         onChange(math.floor(value + 0.5))
@@ -144,17 +131,16 @@ local function Slider(row, minimum, maximum, onChange, withBox)
     return slider
 end
 
--- A box on a slider's right for typing an exact amount. Enter or clicking
--- away applies it, and the setter keeps it in range; Escape, or a box left
--- empty or not holding a number, puts the current value back. A gold box
--- takes decimals (0.5), so it is not numeric; the whole ones refuse them.
-local function NumberBox(row, slider, current, apply, decimal)
+-- A box on a slider's right for typing an exact amount of gold, for example
+-- 0.5. Enter or clicking away applies it, and the setter keeps it in range;
+-- Escape, or a box left empty or not holding an amount, puts the current
+-- value back.
+local function GoldBox(row, slider, current, apply)
     local box = CreateFrame("EditBox", nil, row, "InputBoxTemplate")
-    box:SetSize(NUMBER_BOX_WIDTH, 20)
+    box:SetSize(GOLD_BOX_WIDTH, 20)
     box:SetPoint("LEFT", slider, "RIGHT", 14, 0)
     box:SetAutoFocus(false)
-    if not decimal then box:SetNumeric(true) end
-    box:SetMaxLetters(decimal and 7 or 4)
+    box:SetMaxLetters(GOLD_BOX_LETTERS)
     box:SetJustifyH("CENTER")
     box:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
     box:SetScript("OnEscapePressed", function(self)
@@ -163,33 +149,63 @@ local function NumberBox(row, slider, current, apply, decimal)
     end)
     -- Hooked, so the template still clears its highlight.
     box:HookScript("OnEditFocusLost", function(self)
-        local value = tonumber(self:GetText())
-        if value and not self.cancelled then apply(value) end
+        local copper = API.ParseGold(strtrim(self:GetText() or ""))
+        if copper and not self.cancelled then apply(copper) end
         self.cancelled = false
-        self:SetText((decimal and GoldText or WholeNumber)(current()))
+        self:SetText(API.GoldText(current()))
     end)
     return box
 end
 
--- Shows a value in a NumberBox, unless a number is being typed into it.
-local function SetBoxValue(box, value, decimal)
-    if not box:HasFocus() then
-        box:SetText((decimal and GoldText or WholeNumber)(value))
-    end
+-- Shows an amount in a GoldBox, unless one is being typed into it.
+local function SetBoxValue(box, copper)
+    if not box:HasFocus() then box:SetText(API.GoldText(copper)) end
+end
+
+-- A gold slider and its box, both setting copper through apply.
+local function GoldRow(text, maximum, key, apply)
+    local row = Row(text)
+    local slider = Slider(row, 0, maximum, function(gold) apply(gold * API.COPPER_PER_GOLD) end)
+    local box = GoldBox(row, slider, function() return API.GetDB()[key] end, apply)
+    return slider, box
+end
+
+-- The client's dropdown. The generator runs every time the menu opens and on
+-- every refresh, so the button shows the selection.
+local function Dropdown(row, width, generator)
+    local dropdown = CreateFrame("DropdownButton", nil, row, "WowStyle1DropdownTemplate")
+    dropdown:SetPoint("LEFT", row, "CENTER", CONTROL_X, 0)
+    dropdown:SetWidth(width)
+    dropdown:SetupMenu(generator)
+    controls.dropdowns[#controls.dropdowns + 1] = dropdown
+    return dropdown
+end
+
+-- A read-only value on a row, in white.
+local function Value(row)
+    local value = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    value:SetPoint("LEFT", row, "CENTER", CONTROL_X, 0)
+    value:SetPoint("RIGHT", row, "RIGHT", -10, 0)
+    value:SetJustifyH("LEFT")
+    value:SetWordWrap(false)
+    value:SetText("")
+    return value
 end
 
 --------------------------------------------------------------------------------
 -- Keeping the page in step
 --------------------------------------------------------------------------------
 
--- The Status section's lines, straight from ns.API.Status(), which rereads
--- the bags each time it is asked for.
-local function RefreshStatus()
-    local status = API.Status()
-    controls.statusQuiver:SetText("Quiver: " .. status.quiver)
-    controls.statusKind:SetText("Kind: " .. status.kind)
-    controls.statusRounds:SetText("Rounds: " .. status.rounds)
-    controls.statusAmmoSlot:SetText("Ammo slot: " .. status.ammoSlot)
+local function GoldValue(copper)
+    return math.floor(copper / API.COPPER_PER_GOLD + 0.5)
+end
+
+-- The status rows, read fresh.
+local function UpdateStatus()
+    local values = {}
+    for _, line in ipairs(API.StatusLines()) do values[line[1]] = line[2] end
+    controls.status["Quiver"]:SetText(values["Quiver"] or values["Status"] or "")
+    controls.status["Ammo slot"]:SetText(values["Ammo slot"] or "")
 end
 
 local function RefreshPage()
@@ -201,11 +217,14 @@ local function RefreshPage()
     controls.highlight:SetChecked(db.highlight)
     controls.highlightOther:SetChecked(db.highlightOther)
     controls.pulse:SetChecked(db.pulse)
-    controls.keep:SetValue(db.keepCopper / 10000)
-    controls.cap:SetValue(db.capCopper / 10000)
-    SetBoxValue(controls.keepBox, db.keepCopper / 10000, true)
-    SetBoxValue(controls.capBox, db.capCopper / 10000, true)
-    RefreshStatus()
+    controls.keep:SetValue(GoldValue(db.keepCopper))
+    controls.cap:SetValue(GoldValue(db.capCopper))
+    SetBoxValue(controls.keepBox, db.keepCopper)
+    SetBoxValue(controls.capBox, db.capCopper)
+    for _, dropdown in ipairs(controls.dropdowns) do
+        dropdown:GenerateMenu()
+    end
+    UpdateStatus()
     refreshing = false
 end
 
@@ -237,8 +256,8 @@ local function BuildHeader()
     divider:SetAtlas("Options_HorizontalDivider", true)
     divider:SetPoint("TOP", 0, -HEADER_HEIGHT)
 
-    -- Defaults takes a second click, as ItemTree's does: the first only asks.
-    -- Leaving the page puts the question away again.
+    -- Defaults takes a second click: the first only asks. Leaving the page
+    -- puts the question away again.
     local defaults = CreateFrame("Button", nil, page, "UIPanelButtonTemplate")
     defaults:SetSize(DEFAULTS_WIDTH, DEFAULTS_HEIGHT)
     defaults:SetPoint("TOPRIGHT", DEFAULTS_X, DEFAULTS_Y)
@@ -261,59 +280,65 @@ local function BuildBuyingSection()
     Section("Buying")
 
     controls.autoBuy = Checkbox(Row("Auto buy"), API.SetAutoBuy)
-    Tooltip(controls.autoBuy, "Opens a vendor that sells ammo for your bag's kind, and buys exactly what fills the bag. Hold Shift while opening the vendor to skip it once.")
+    Tooltip(controls.autoBuy, "Talking to a vendor that sells your ammo fills your quiver or ammo pouch. Hold Shift while you talk to the vendor to skip it once. The Fletcher button in the vendor window refills either way.")
+
+    controls.keep, controls.keepBox = GoldRow("Keep gold", KEEP_SLIDER_MAX, "keepCopper", API.SetKeepCopper)
+    Tooltip(controls.keepBox, "Money a refill never touches, in gold. Type an amount such as 0.5, then press Enter.")
+
+    controls.cap, controls.capBox = GoldRow("Spending cap", CAP_SLIDER_MAX, "capCopper", API.SetCapCopper)
+    Tooltip(controls.capBox, "The most one refill spends, in gold; 0 means no cap. Type an amount such as 0.5, then press Enter.")
+
+    Dropdown(Row("When my ammo is better"), DROPDOWN_WIDTH, function(_, root)
+        local db = API.GetDB()
+        for _, choice in ipairs(API.BETTER_CHOICES) do
+            local key = choice.key
+            root:CreateRadio(choice.name,
+                function() return db.betterAmmo == key end,
+                function() API.SetBetterAmmo(key) end)
+        end
+    end)
 
     controls.report = Checkbox(Row("Report purchases in chat"), API.SetReport)
-    Tooltip(controls.report, "One chat line when an automatic refill is done, with what was bought and what it cost. A manual refill reports anyway.")
-
-    -- The reserve, in whole gold on the slider, with decimals in the box.
-    local keepRow = Row("Keep gold")
-    controls.keep = Slider(keepRow, 0, API.MAX_GOLD, function(value)
-        API.SetKeepGold(value)
-    end, true)
-    controls.keepBox = NumberBox(keepRow, controls.keep,
-        function() return API.GetDB().keepCopper / 10000 end, API.SetKeepGold, true)
-    Tooltip(controls.keepBox, "Never spend below this much gold, for example 0.5 for half. Type a number, then press Enter.")
-    SetBoxValue(controls.keepBox, API.GetDB().keepCopper / 10000, true)
-
-    local capRow = Row("Spending cap")
-    controls.cap = Slider(capRow, 0, API.MAX_GOLD, function(value)
-        API.SetCapGold(value)
-    end, true)
-    controls.capBox = NumberBox(capRow, controls.cap,
-        function() return API.GetDB().capCopper / 10000 end, API.SetCapGold, true)
-    Tooltip(controls.capBox, "The most one refill may spend, for example 1 for a gold. 0 means no cap. Type a number, then press Enter.")
-    SetBoxValue(controls.capBox, API.GetDB().capCopper / 10000, true)
+    Tooltip(controls.report, "One line in chat after each refill: what was bought, what it cost and how many of the quiver's slots are in use.")
 end
 
 local function BuildVendorSection()
     Section("Vendor window")
 
     controls.showButton = Checkbox(Row("Show vendor button"), API.SetShowButton)
-    Tooltip(controls.showButton, "The small button at the vendor window's top right, whose click refills the quiver and whose tooltip says what a refill would do.")
+    Tooltip(controls.showButton, "A small button at the top of the vendor window: left click to refill, right click for these options.")
 
     controls.highlight = Checkbox(Row("Highlight best ammo"), API.SetHighlight)
     Tooltip(controls.highlight, "A gold border around the best ammo the vendor sells that you can use.")
 
     controls.highlightOther = Checkbox(Row("Highlight other usable ammo"), API.SetHighlightOther)
-    Tooltip(controls.highlightOther, "A dim green border around the other ammo of your bag's kind that the vendor sells.")
+    Tooltip(controls.highlightOther, "A dimmer green border around the other ammo of the same kind you can use.")
 
     controls.pulse = Checkbox(Row("Pulse"), API.SetPulse)
-    Tooltip(controls.pulse, "The gold border gently breathes.")
+    Tooltip(controls.pulse, "The best ammo gets the gold glow that runs around an ability when it procs. Off, it keeps a still gold glow.")
 end
 
 local function BuildStatusSection()
     Section("Status")
+    controls.status = {}
+    for _, label in ipairs(STATUS_ROWS) do
+        controls.status[label] = Value(Row(label))
+    end
 
-    controls.statusQuiver = TextRow()
-    controls.statusKind = TextRow()
-    controls.statusRounds = TextRow()
-    controls.statusAmmoSlot = TextRow()
+    -- Where the vendor's side is shown, in the settings list's grey.
+    local row = NextRow(ROW_HEIGHT)
+    local hint = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    hint:SetPoint("LEFT", LABEL_X, 0)
+    hint:SetPoint("RIGHT", row, "RIGHT", -10, 0)
+    hint:SetJustifyH("LEFT")
+    hint:SetTextColor(0.5, 0.5, 0.5)
+    hint:SetText(VENDOR_HINT)
 end
 
 local function BuildPage()
     page = CreateFrame("Frame")
     page:Hide()
+    controls.dropdowns = {}
 
     BuildHeader()
 
