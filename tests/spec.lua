@@ -362,6 +362,73 @@ test("a vendor that sells only the other kind buys nothing and shows no button",
 end)
 
 --------------------------------------------------------------------------------
+-- The level before a new tier
+--------------------------------------------------------------------------------
+
+test("one level before a better tier the visit warns and still buys", function()
+    hunter({ level = 24 })
+    __open_vendor(arrowVendor())
+    assert_eq(__buy_log[1].id, SHARP, "not the ammo of today")
+    assert_true(__printed("next level unlocks Razor Arrow, the better arrow sold here."), "no warning")
+    assert_eq(__printed_count("next level unlocks"), 1, "more than one warning")
+end)
+
+test("the warning comes one level before a tier, and not before that", function()
+    local warns = { [9] = "Sharp Arrow", [24] = "Razor Arrow", [39] = "Jagged Arrow" }
+    for _, level in ipairs({ 8, 9, 10, 23, 24, 25, 38, 39, 40 }) do
+        hunter({ level = level })
+        __open_vendor(arrowVendor())
+        if warns[level] then
+            assert_true(__printed("next level unlocks " .. warns[level]), "no warning at level " .. level)
+        else
+            assert_false(__printed("next level unlocks"), "a warning at level " .. level)
+        end
+    end
+end)
+
+test("the warning follows the bag: bullets too", function()
+    hunter({ level = 24, bags = { [0] = backpack(), [1] = pouch(4) } })
+    __open_vendor(bulletVendor())
+    assert_eq(__buy_log[1].id, HEAVY, "not the bullets of today")
+    assert_true(__printed("next level unlocks Solid Shot, the better bullet sold here."), "no warning")
+end)
+
+test("the warning is said once per visit", function()
+    hunter({ level = 24 })
+    __open_vendor(arrowVendor())
+    __merchant_update()
+    __fire("PLAYER_MONEY")
+    assert_eq(__printed_count("next level unlocks"), 1, "said more than once")
+end)
+
+test("a full quiver is not warned about in chat, only in the tooltip", function()
+    local contents = { [1] = { id = RAZOR, count = 200 }, [2] = { id = RAZOR, count = 200 },
+        [3] = { id = RAZOR, count = 200 }, [4] = { id = RAZOR, count = 200 } }
+    hunter({ level = 24, bags = { [0] = backpack(), [1] = quiver(4, contents) }, db = { autoBuy = false } })
+    __open_vendor(arrowVendor())
+    assert_false(__printed("next level unlocks"), "the auto buy talked about a full quiver")
+    local lines = hover_button()
+    assert_true(has_line(lines, "Next level unlocks Razor Arrow, the better arrow sold here."), lines_text(lines))
+end)
+
+test("a vendor that sells only the next tier warns and buys nothing", function()
+    hunter({ level = 9 })
+    __open_vendor({ { id = SHARP, price = 50 } })
+    assert_eq(#__buy_log, 0)
+    assert_true(__printed("next level unlocks Sharp Arrow"), "no warning")
+    slash("status")
+    assert_true(__printed("Best here: Nothing that fits"), "no best line")
+    assert_true(__printed("Next level: Sharp Arrow at level 10"), "no next level line")
+end)
+
+test("a secret required level is never compared", function()
+    hunter({ level = 24 })
+    __items[RAZOR].minLevel = __secret()
+    __open_vendor(arrowVendor())
+    assert_false(__printed("next level unlocks"), "warned without a level")
+end)
+
+--------------------------------------------------------------------------------
 -- How many
 --------------------------------------------------------------------------------
 

@@ -21,6 +21,11 @@ Fletcher: bought 1400 Razor Arrow for 7s. Quiver full (10 / 10 slots).
   sold for gold counts, and nothing sold out. Fletcher ranks whatever the vendor has, so special or
   regional vendor ammo works too. It reads the vendor's list as the window shows it, so the vendor
   window's filter applies.
+- **The level before a new tier**: when the vendor also sells ammo of your kind that unlocks at your
+  next level, Fletcher says so once per visit and in the button's tooltip, for example *Next level
+  unlocks Razor Arrow, the better arrow sold here.* It refills anyway: a stack that is second best
+  for one level beats an empty quiver. Nothing is hardcoded, so a vendor with its own ammo gets the
+  same warning.
 - **How much**: it goes by the quiver's slots, not by how many rounds it could hold. Each empty slot
   gets one full stack. A slot that already holds ammo, a part stack included, is left exactly as it
   is: the game puts a bought stack in an empty slot, not on top of a part stack, so buying for a part

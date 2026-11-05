@@ -104,9 +104,9 @@ end
 -- the client's Enum.ItemQuiverSubclass.
 local KINDS = {
     arrow  = { projectile = PROJECTILE_ARROW,  family = FAMILY_ARROWS,
-               noun = "arrows",  holder = "quiver",     title = "Quiver" },
+               one = "arrow",  noun = "arrows",  holder = "quiver",     title = "Quiver" },
     bullet = { projectile = PROJECTILE_BULLET, family = FAMILY_BULLETS,
-               noun = "bullets", holder = "ammo pouch", title = "Ammo pouch" },
+               one = "bullet", noun = "bullets", holder = "ammo pouch", title = "Ammo pouch" },
 }
 local KIND_ORDER = { "arrow", "bullet" }
 
@@ -161,6 +161,7 @@ local scan = {
     quiverIcon = nil,
     sellsAmmo = false,  -- the vendor sells ammo of either kind
     best = nil,         -- the best ammo of `kind` (or the weapon's) the vendor sells
+    nextTier = nil,     -- the better ammo sold here that unlocks at the next level
     others = {},        -- vendor index -> true, for the other usable ammo of that kind
     loading = false,    -- an item the scan needs is not cached yet
     loadedID = nil,     -- the ammo in the ammo slot
@@ -188,12 +189,19 @@ local NO_BAGS = {}
 local candidates = {}
 local numCandidates = 0
 
+-- The vendor's ammo of that kind that unlocks at the next level, ranked the
+-- same way, so the visit can say what a refill now is about to be replaced by.
+-- Kept apart from `candidates`: those are what the hunter can use today.
+local nextCandidates = {}
+local numNext = 0
+
 local waiting = {}          -- item id -> true, for items the scan is missing
 local itemTries = 0         -- times one came back still missing
 local gaveUp = false        -- stopped waiting this visit
 local autoPending = false   -- this visit's auto buy has not run yet
 local manualPending = false -- a Refill click is waiting for item data
 local warned = false        -- the weapon mismatch was mentioned this visit
+local warnedNext = false    -- the ammo at the next level was mentioned this visit
 
 -- The refill in progress. Its plan is fixed when it starts.
 local order = {
@@ -529,8 +537,8 @@ end
 -- Ranks the vendor's ammo of one kind. The list is the one the player sees,
 -- after the vendor window's filter; Fletcher never changes the filter.
 local function ScanVendor(kind)
-    numCandidates = 0
-    scan.best, scan.sellsAmmo = nil, false
+    numCandidates, numNext = 0, 0
+    scan.best, scan.sellsAmmo, scan.nextTier = nil, false, nil
     Wipe(scan.others)
     if not scan.open then return end
 
@@ -563,6 +571,20 @@ local function ScanVendor(kind)
                 -- game on 2026-10-17: 200 for every arrow, one vendor batch.
                 record.maxStack = Number(GetMerchantItemMaxStack(index))
                 if not scan.best or Better(record, scan.best) then scan.best = record end
+            elseif level and stackSize and stackSize >= 1 and minLevel == level + 1 then
+                -- The tier this vendor sells that unlocks at the next level.
+                -- Rated like the usable ammo: a refill now fills with what is
+                -- second best as soon as one level comes.
+                numNext = numNext + 1
+                local record = nextCandidates[numNext]
+                if not record then
+                    record = {}
+                    nextCandidates[numNext] = record
+                end
+                record.index, record.itemID, record.name = index, itemID, name
+                record.price, record.batch = Number(info.price), math.floor(Number(info.stackCount))
+                record.itemLevel, record.minLevel = itemLevel, minLevel
+                if not scan.nextTier or Better(record, scan.nextTier) then scan.nextTier = record end
             end
         end
     end
@@ -822,6 +844,15 @@ local function BestLine()
     return best.name
 end
 
+-- "Next level unlocks Razor Arrow, the better arrow sold here.", or nil. The
+-- vendor's next tier of the same ammo is exactly one level away, so a refill
+-- now fills with what is second best as soon as that level comes.
+local function NextTierLine()
+    local tier = scan.nextTier
+    if not (scan.kind and tier) then return nil end
+    return ("Next level unlocks %s, the better %s sold here."):format(tier.name, KINDS[scan.kind].one)
+end
+
 -- "600 for 1s 50c", or nil when a refill would buy nothing.
 local function RefillLine()
     if scan.status ~= "ready" then return nil end
@@ -860,6 +891,10 @@ local function StatusLines()
     lines[#lines + 1] = { "Ammo slot", LoadedLine() or "Loading" }
     if scan.open then
         lines[#lines + 1] = { "Best here", BestLine() or "Nothing that fits" }
+        if scan.kind and scan.nextTier then
+            lines[#lines + 1] = { "Next level", ("%s at level %d"):format(scan.nextTier.name,
+                scan.nextTier.minLevel) }
+        end
         lines[#lines + 1] = { "Refill", RefillLine() or scan.message or "" }
     end
     return lines
@@ -1035,10 +1070,23 @@ local function WarnMismatch()
     Print(ChatLine(line))
 end
 
+-- Says once per visit, when a refill would fill the quiver with ammo that a
+-- better tier replaces at the next level. The refill still goes ahead: an
+-- empty quiver is worse than a stack that is second best for one level.
+local function WarnNextTier()
+    if warnedNext then return end
+    if not (scan.status == "ready" or scan.status == "noammo") then return end
+    local line = NextTierLine()
+    if not line then return end
+    warnedNext = true
+    Print(ChatLine(line))
+end
+
 -- After anything at an open vendor that may change what is read.
 local function Update()
     Evaluate()
     WarnMismatch()
+    WarnNextTier()
     TryAuto()
     NotifyVendor()
 end
@@ -1261,6 +1309,7 @@ ns.API = {
     Refill = function() return Refill(true) end,
     QuiverLine = QuiverLine,
     BestLine = BestLine,
+    NextTierLine = NextTierLine,
     RefillLine = RefillLine,
     MismatchLine = MismatchLine,
     LeftOutText = LeftOutText,
@@ -1308,7 +1357,7 @@ local VENDOR_EVENTS = {
 
 local function OnVendorShow()
     scan.open = true
-    warned, itemTries, gaveUp, manualPending = false, 0, false, false
+    warned, warnedNext, itemTries, gaveUp, manualPending = false, false, 0, false, false
     for _, name in ipairs(VENDOR_EVENTS) do
         pcall(events.RegisterEvent, events, name)
     end
@@ -1328,7 +1377,7 @@ local function OnVendorClosed()
     end
     pcall(events.UnregisterEvent, events, "GET_ITEM_INFO_RECEIVED")
     Wipe(waiting)
-    scan.best, scan.loading = nil, false
+    scan.best, scan.nextTier, scan.loading = nil, nil, false
     Wipe(scan.others)
     NotifyVendor()
 end

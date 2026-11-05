@@ -237,6 +237,10 @@ local function ShowTooltip(owner)
     if quiver then AddValueLine("Quiver", quiver) end
     local best = API.BestLine()
     if best then AddValueLine("Best here", best) end
+    local nextTier = API.NextTierLine()
+    if nextTier then
+        GameTooltip:AddLine(nextTier, HINT_COLOR[1], HINT_COLOR[2], HINT_COLOR[3], true)
+    end
 
     local refill = API.RefillLine()
     if API.IsBuying() then
