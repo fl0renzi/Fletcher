@@ -109,10 +109,10 @@ login. The settings page is still there, since the settings are shared by every 
 
 ## Install
 
-Install it from CurseForge, or copy `Fletcher.toc`, `Fletcher.lua`, `Fletcher_Vendor.lua` and
-`Fletcher_Options.lua` into `Interface\AddOns\Fletcher` in the Forever client folder, then restart
-the game. The game reads the `.toc` only at startup, so a new addon, or a new file in one, is not
-picked up by `/reload`.
+Install it from CurseForge or the release page on GitHub, or copy `Fletcher.toc`, `Fletcher.lua`,
+`Fletcher_Vendor.lua` and `Fletcher_Options.lua` into `Interface\AddOns\Fletcher` in the Forever
+client folder, then restart the game. The game reads the `.toc` only at startup, so a new addon, or
+a new file in one, is not picked up by `/reload`.
 
 ## Notes
 
