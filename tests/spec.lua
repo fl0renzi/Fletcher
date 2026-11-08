@@ -310,6 +310,9 @@ test("the best arrow follows the required level", function()
     for level, expected in pairs(picks) do
         hunter({ level = level })
         __open_vendor(arrowVendor())
+        if FletcherConfirmPopup and FletcherConfirmPopup:IsShown() then
+            __script(FletcherConfirmPopup.buy, "OnClick")
+        end
         assert_eq(__buy_log[1] and __buy_log[1].id, expected, "level " .. level)
     end
 end)
@@ -365,32 +368,90 @@ end)
 -- The level before a new tier
 --------------------------------------------------------------------------------
 
-test("one level before a better tier the visit warns and still buys", function()
+local function popup() return FletcherConfirmPopup end
+
+test("one level before a better tier auto buy asks with a popup instead of buying", function()
     hunter({ level = 24 })
     __open_vendor(arrowVendor())
-    assert_eq(__buy_log[1].id, SHARP, "not the ammo of today")
+    assert_eq(#__buy_log, 0, "bought before the popup was answered")
     assert_true(__printed("next level unlocks Razor Arrow, the better arrow sold here."), "no warning")
     assert_eq(__printed_count("next level unlocks"), 1, "more than one warning")
+    assert_true(popup() and popup():IsShown(), "no confirmation popup")
+    assert_eq(popup().text:GetText(),
+        "Next level unlocks Razor Arrow, the better arrow sold here.\n\nBuy 800 Sharp Arrow for 2s anyway?")
+
+    __script(popup().buy, "OnClick")
+    assert_false(popup():IsShown(), "popup stayed open after Buy anyway")
+    assert_eq(__buy_log[1] and __buy_log[1].id, SHARP, "not the ammo of today")
+    __deliver_all()
+    assert_eq(__bought(), 800)
 end)
 
-test("the warning comes one level before a tier, and not before that", function()
+test("Skip on the popup leaves the quiver as it is, and closing the vendor hides the popup", function()
+    hunter({ level = 24 })
+    __open_vendor(arrowVendor())
+    assert_true(popup() and popup():IsShown(), "no popup")
+    __script(popup().skip, "OnClick")
+    assert_false(popup():IsShown(), "popup stayed open after Skip")
+    assert_eq(#__buy_log, 0, "bought after Skip")
+    __merchant_update()
+    assert_false(popup():IsShown(), "popup came back in the same visit")
+
+    __close_vendor()
+    __open_vendor(arrowVendor())
+    assert_true(popup():IsShown(), "no popup on the next visit")
+    __close_vendor()
+    assert_false(popup():IsShown(), "popup stayed open after the vendor closed")
+end)
+
+test("the vendor button and /ammo refill buy at once and dismiss the popup", function()
+    hunter({ level = 24 })
+    __open_vendor(arrowVendor())
+    assert_true(popup() and popup():IsShown(), "no popup")
+    click_button()
+    assert_false(popup():IsShown(), "a manual refill left the popup open")
+    assert_eq(__buy_log[1] and __buy_log[1].id, SHARP)
+end)
+
+test("with auto buy off or Shift held, no popup is shown", function()
+    hunter({ level = 24, db = { autoBuy = false } })
+    __open_vendor(arrowVendor())
+    assert_eq(popup(), nil, "popup built with auto buy off")
+
+    hunter({ level = 24 })
+    __shift = true
+    __open_vendor(arrowVendor())
+    assert_eq(popup(), nil, "popup built with Shift held")
+    __shift = false
+end)
+
+test("the warning and popup come one level before a tier, and not before that", function()
     local warns = { [9] = "Sharp Arrow", [24] = "Razor Arrow", [39] = "Jagged Arrow" }
     for _, level in ipairs({ 8, 9, 10, 23, 24, 25, 38, 39, 40 }) do
         hunter({ level = level })
         __open_vendor(arrowVendor())
         if warns[level] then
             assert_true(__printed("next level unlocks " .. warns[level]), "no warning at level " .. level)
+            assert_true(popup() and popup():IsShown(), "no popup at level " .. level)
+            assert_eq(#__buy_log, 0, "bought without confirmation at level " .. level)
         else
             assert_false(__printed("next level unlocks"), "a warning at level " .. level)
+            assert_eq(popup(), nil, "popup built at level " .. level)
+            assert_true(#__buy_log > 0, "did not auto buy at level " .. level)
         end
     end
 end)
 
-test("the warning follows the bag: bullets too", function()
+test("the warning and popup follow the bag: bullets too", function()
     hunter({ level = 24, bags = { [0] = backpack(), [1] = pouch(4) } })
     __open_vendor(bulletVendor())
-    assert_eq(__buy_log[1].id, HEAVY, "not the bullets of today")
+    assert_eq(#__buy_log, 0, "bought before confirmation")
     assert_true(__printed("next level unlocks Solid Shot, the better bullet sold here."), "no warning")
+    assert_true(popup() and popup():IsShown(), "no popup for bullets")
+    assert_eq(popup().text:GetText(),
+        "Next level unlocks Solid Shot, the better bullet sold here.\n\nBuy 800 Heavy Shot for 2s anyway?")
+    __script(popup().buy, "OnClick")
+    assert_eq(__buy_log[1].id, HEAVY, "not the bullets of today")
 end)
 
 test("the warning is said once per visit", function()
@@ -401,20 +462,22 @@ test("the warning is said once per visit", function()
     assert_eq(__printed_count("next level unlocks"), 1, "said more than once")
 end)
 
-test("a full quiver is not warned about in chat, only in the tooltip", function()
+test("a full quiver is not warned about in chat or with a popup, only in the tooltip", function()
     local contents = { [1] = { id = RAZOR, count = 200 }, [2] = { id = RAZOR, count = 200 },
         [3] = { id = RAZOR, count = 200 }, [4] = { id = RAZOR, count = 200 } }
-    hunter({ level = 24, bags = { [0] = backpack(), [1] = quiver(4, contents) }, db = { autoBuy = false } })
+    hunter({ level = 24, bags = { [0] = backpack(), [1] = quiver(4, contents) } })
     __open_vendor(arrowVendor())
     assert_false(__printed("next level unlocks"), "the auto buy talked about a full quiver")
+    assert_eq(popup(), nil, "popup built for a full quiver")
     local lines = hover_button()
     assert_true(has_line(lines, "Next level unlocks Razor Arrow, the better arrow sold here."), lines_text(lines))
 end)
 
-test("a vendor that sells only the next tier warns and buys nothing", function()
+test("a vendor that sells only the next tier warns in chat and shows no popup", function()
     hunter({ level = 9 })
     __open_vendor({ { id = SHARP, price = 50 } })
     assert_eq(#__buy_log, 0)
+    assert_eq(popup(), nil, "popup built with nothing to buy")
     assert_true(__printed("next level unlocks Sharp Arrow"), "no warning")
     slash("status")
     assert_true(__printed("Best here: Nothing that fits"), "no best line")
@@ -426,6 +489,7 @@ test("a secret required level is never compared", function()
     __items[RAZOR].minLevel = __secret()
     __open_vendor(arrowVendor())
     assert_false(__printed("next level unlocks"), "warned without a level")
+    assert_eq(popup(), nil, "popup built without a level")
 end)
 
 --------------------------------------------------------------------------------

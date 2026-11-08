@@ -1,5 +1,9 @@
 # Fletcher
 
+## 1.0.1
+
+- One level before a better arrow or bullet sold at the vendor, auto buy now asks with a confirmation popup (*Buy anyway* or *Skip*) instead of refilling on its own.
+
 ## 1.0.0
 
 First release.

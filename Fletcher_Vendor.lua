@@ -58,6 +58,10 @@ local BUTTON_HIGHLIGHT = "Interface\\Buttons\\ButtonHilight-Square"
 -- MERCHANT_ITEMS_PER_PAGE, when the client does not define it.
 local ITEMS_PER_PAGE = 10
 
+local CONFIRM_WIDTH, CONFIRM_HEIGHT = 320, 128
+local CONFIRM_BUTTON_WIDTH, CONFIRM_BUTTON_HEIGHT = 108, 22
+local CONFIRM_BG = { 0.08, 0.08, 0.08, 0.92 }
+
 local LABEL_COLOR = API.LABEL_COLOR
 local HINT_COLOR = API.HINT_COLOR
 
@@ -67,6 +71,7 @@ local HINT_COLOR = API.HINT_COLOR
 
 local built = false
 local button       -- the vendor button
+local confirm      -- the confirmation popup one level before a better tier, made on first use
 local overlays = {} -- the mark on each item button, by its place on the page
 local perPage = ITEMS_PER_PAGE
 
@@ -321,6 +326,74 @@ local function BuildButton()
     button:Hide()
 end
 
+-- The popup shown when auto buy would fill the quiver one level before a
+-- better tier sold here. Built the first time a visit needs it.
+local function BuildConfirm()
+    confirm = CreateFrame("Frame", "FletcherConfirmPopup", MerchantFrame)
+    confirm:SetSize(CONFIRM_WIDTH, CONFIRM_HEIGHT)
+    confirm:SetPoint("TOP", UIParent, "TOP", 0, -135)
+    confirm:SetFrameStrata("DIALOG")
+    confirm:EnableMouse(true)
+
+    local bg = confirm:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(confirm)
+    bg:SetColorTexture(CONFIRM_BG[1], CONFIRM_BG[2], CONFIRM_BG[3], CONFIRM_BG[4])
+
+    local border = CreateFrame("Frame", nil, confirm, "DialogBorderDarkTemplate")
+    border:SetAllPoints(confirm)
+
+    local text = confirm:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    text:SetPoint("TOPLEFT", 20, -18)
+    text:SetPoint("TOPRIGHT", -20, -18)
+    text:SetJustifyH("CENTER")
+    text:SetWordWrap(true)
+    confirm.text = text
+
+    local buy = CreateFrame("Button", nil, confirm, "UIPanelButtonTemplate")
+    buy:SetSize(CONFIRM_BUTTON_WIDTH, CONFIRM_BUTTON_HEIGHT)
+    buy:SetPoint("BOTTOMRIGHT", confirm, "BOTTOM", -6, 16)
+    buy:SetText("Buy anyway")
+    buy:SetScript("OnClick", function()
+        confirm:Hide()
+        API.Refill()
+    end)
+    confirm.buy = buy
+
+    local skip = CreateFrame("Button", nil, confirm, "UIPanelButtonTemplate")
+    skip:SetSize(CONFIRM_BUTTON_WIDTH, CONFIRM_BUTTON_HEIGHT)
+    skip:SetPoint("BOTTOMLEFT", confirm, "BOTTOM", 6, 16)
+    skip:SetText("Skip")
+    skip:SetScript("OnClick", function()
+        confirm:Hide()
+    end)
+    confirm.skip = skip
+
+    confirm:Hide()
+end
+
+local function UpdateConfirm()
+    if not (confirm and confirm:IsShown()) then return end
+    local nextLine = API.NextTierLine()
+    local best = scan.best
+    if not (scan.open and scan.status == "ready" and nextLine and best) or API.IsBuying() then
+        confirm:Hide()
+        return
+    end
+    confirm.text:SetText(("%s\n\nBuy %d %s for %s anyway?")
+        :format(nextLine, scan.buyRounds, best.name, API.MoneyText(scan.buyCost)))
+end
+
+function ns.ShowConfirm()
+    if not MerchantFrame then return end
+    if not confirm then BuildConfirm() end
+    confirm:Show()
+    UpdateConfirm()
+end
+
+function ns.HideConfirm()
+    if confirm then confirm:Hide() end
+end
+
 -- After the vendor window draws a page, of the vendor's list or the
 -- buyback: the marks follow, and the tooltip's page note with them.
 local function OnPageDrawn()
@@ -351,6 +424,7 @@ function ns.OnScanChanged()
     if not built then return end
     UpdateButton()
     UpdateOverlays()
+    UpdateConfirm()
     RefreshTooltip()
 end
 

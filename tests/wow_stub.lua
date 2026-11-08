@@ -787,6 +787,7 @@ local templates = {}
 
 templates.UICheckButtonTemplate = function() end
 templates.UIPanelButtonTemplate = function() end
+templates.DialogBorderDarkTemplate = function() end
 
 -- The client's scroll frame, with the scroll bar its OnLoad makes.
 templates.ScrollFrameTemplate = function(frame)
@@ -1112,6 +1113,7 @@ local function resetGlobals()
     SlashCmdList = {}
     SLASH_FLETCHER1, SLASH_FLETCHER2 = nil, nil
     FletcherVendorButton = nil
+    FletcherConfirmPopup = nil
 
     buildMerchantFrame()
 end

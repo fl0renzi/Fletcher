@@ -1020,7 +1020,10 @@ local function Refill(manual)
         return false
     end
     if order.active then return false end
-    if manual then autoPending = false end
+    if manual then
+        autoPending = false
+        if ns.HideConfirm then ns.HideConfirm() end
+    end
 
     Evaluate()
     if scan.status == "loading" then
@@ -1050,13 +1053,18 @@ local function Refill(manual)
 end
 
 -- The auto buy runs once per vendor visit, as soon as the vendor's list and
--- the items in it are in.
+-- the items in it are in. One level before a better tier sold here, it asks
+-- with a popup instead of buying on its own.
 local function TryAuto()
     if not autoPending or order.active then return end
     local count = Number(GetMerchantNumItems())
     if not count or count == 0 then return end -- MERCHANT_UPDATE brings the list
     if scan.loading then return end            -- GET_ITEM_INFO_RECEIVED brings the items
     autoPending = false
+    if scan.status == "ready" and scan.nextTier and ns.ShowConfirm then
+        ns.ShowConfirm()
+        return
+    end
     Refill(false)
 end
 
@@ -1070,9 +1078,8 @@ local function WarnMismatch()
     Print(ChatLine(line))
 end
 
--- Says once per visit, when a refill would fill the quiver with ammo that a
--- better tier replaces at the next level. The refill still goes ahead: an
--- empty quiver is worse than a stack that is second best for one level.
+-- Says once per visit, when the vendor also sells a better tier that unlocks
+-- at the next level.
 local function WarnNextTier()
     if warnedNext then return end
     if not (scan.status == "ready" or scan.status == "noammo") then return end
@@ -1131,6 +1138,10 @@ end
 
 local function SetAutoBuy(on)
     db.autoBuy = on and true or false
+    if not db.autoBuy then
+        autoPending = false
+        if ns.HideConfirm then ns.HideConfirm() end
+    end
     NotifyChanged()
 end
 
@@ -1372,6 +1383,7 @@ local function OnVendorClosed()
     scan.open = false
     FinishRefill("closed")
     autoPending, manualPending = false, false
+    if ns.HideConfirm then ns.HideConfirm() end
     for _, name in ipairs(VENDOR_EVENTS) do
         pcall(events.UnregisterEvent, events, name)
     end

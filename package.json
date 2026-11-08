@@ -1,6 +1,6 @@
 {
   "name": "fletcher",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Headless test harness for the Fletcher WoW addon.",
   "scripts": {
