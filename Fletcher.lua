@@ -99,9 +99,8 @@ do
     end
 end
 
--- The two kinds of ammo. The bag decides which one is bought: a quiver holds
--- arrows, an ammo pouch holds bullets. bagSubclass is filled in at login from
--- the client's Enum.ItemQuiverSubclass.
+-- The two kinds of ammo: a quiver holds arrows, an ammo pouch holds bullets.
+-- bagSubclass is filled in at login from the client's Enum.ItemQuiverSubclass.
 local KINDS = {
     arrow  = { projectile = PROJECTILE_ARROW,  family = FAMILY_ARROWS,
                one = "arrow",  noun = "arrows",  holder = "quiver",     title = "Quiver" },
@@ -160,7 +159,7 @@ local scan = {
     quiverName = nil,
     quiverIcon = nil,
     sellsAmmo = false,  -- the vendor sells ammo of either kind
-    best = nil,         -- the best ammo of `kind` (or the weapon's) the vendor sells
+    best = nil,         -- the best ammo for the weapon (or quiver) the vendor sells
     nextTier = nil,     -- the better ammo sold here that unlocks at the next level
     others = {},        -- vendor index -> true, for the other usable ammo of that kind
     loading = false,    -- an item the scan needs is not cached yet
@@ -484,8 +483,8 @@ local function ReadWeapon()
     if weapon then scan.weaponKind, scan.weaponNoun = weapon.kind, weapon.noun end
 end
 
--- Finds the quiver or ammo pouch. The bag decides the kind; with one of each
--- equipped, the one the ranged weapon fills wins.
+-- Finds the quiver or ammo pouch. With one of each equipped, the one the
+-- ranged weapon fills wins.
 local function ReadQuivers()
     Wipe(bagsByKind.arrow)
     Wipe(bagsByKind.bullet)
@@ -730,15 +729,21 @@ local function LeftOutText(rounds, limit)
     return ("Left out %d you cannot afford."):format(rounds)
 end
 
+local MismatchLine -- defined with the tooltip lines, below
+
 -- What a refill would buy now, and why when it is nothing. The status is one
--- of: noquiver, loading, noammo, better, full, inbags, nearlyfull, money or
--- ready.
+-- of: noquiver, mismatch, loading, noammo, better, full, inbags, nearlyfull,
+-- money or ready.
 local function PlanPurchase()
     scan.buyRounds, scan.buyCost, scan.leftOut, scan.limit = 0, 0, 0, nil
     local best = scan.best
 
     if not scan.kind then
         return SetStatus("noquiver", "Equip a quiver or ammo pouch to refill.")
+    end
+    local mismatch = MismatchLine()
+    if mismatch then
+        return SetStatus("mismatch", mismatch)
     end
     local kind = KINDS[scan.kind]
     if scan.loading then
@@ -810,8 +815,9 @@ local function Evaluate()
     Wipe(waiting)
     ReadWeapon()
     ReadQuivers()
-    -- Without a quiver, the highlight still marks the best ammo for the weapon.
-    ScanVendor(scan.kind or scan.weaponKind)
+    -- Mark what the ranged weapon fires; without one that uses ammo, follow
+    -- the quiver.
+    ScanVendor(scan.weaponKind or scan.kind)
     ReadLoadedAmmo()
     scan.loading = scan.open and not gaveUp and next(waiting) ~= nil
 
@@ -849,8 +855,9 @@ end
 -- now fills with what is second best as soon as that level comes.
 local function NextTierLine()
     local tier = scan.nextTier
-    if not (scan.kind and tier) then return nil end
-    return ("Next level unlocks %s, the better %s sold here."):format(tier.name, KINDS[scan.kind].one)
+    local kind = scan.weaponKind or scan.kind
+    if not (kind and tier) then return nil end
+    return ("Next level unlocks %s, the better %s sold here."):format(tier.name, KINDS[kind].one)
 end
 
 -- "600 for 1s 50c", or nil when a refill would buy nothing.
@@ -860,7 +867,7 @@ local function RefillLine()
 end
 
 -- "Your quiver holds arrows but your gun fires bullets.", or nil.
-local function MismatchLine()
+function MismatchLine()
     if not (scan.kind and scan.weaponKind and scan.kind ~= scan.weaponKind) then return nil end
     local kind = KINDS[scan.kind]
     return ("Your %s holds %s but your %s fires %s."):format(kind.holder, kind.noun,
@@ -891,7 +898,7 @@ local function StatusLines()
     lines[#lines + 1] = { "Ammo slot", LoadedLine() or "Loading" }
     if scan.open then
         lines[#lines + 1] = { "Best here", BestLine() or "Nothing that fits" }
-        if scan.kind and scan.nextTier then
+        if (scan.weaponKind or scan.kind) and scan.nextTier then
             lines[#lines + 1] = { "Next level", ("%s at level %d"):format(scan.nextTier.name,
                 scan.nextTier.minLevel) }
         end
@@ -1069,7 +1076,7 @@ local function TryAuto()
 end
 
 -- Says once per visit, at a vendor that sells ammo, that the quiver and the
--- weapon disagree. The bag still decides what is bought.
+-- weapon disagree, so nothing is bought.
 local function WarnMismatch()
     if warned or not scan.sellsAmmo then return end
     local line = MismatchLine()

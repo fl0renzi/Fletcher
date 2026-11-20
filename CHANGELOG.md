@@ -1,5 +1,9 @@
 # Fletcher
 
+## 1.0.2
+
+- When your equipped quiver or ammo pouch disagrees with your ranged weapon (for example, a gun with a quiver equipped), Fletcher now buys nothing instead of refilling with the wrong ammo, warns once per ammo-vendor visit, and marks the best ammo for your weapon.
+
 ## 1.0.1
 
 - One level before a better arrow or bullet sold at the vendor, auto buy now asks with a confirmation popup (*Buy anyway* or *Skip*) instead of refilling on its own.

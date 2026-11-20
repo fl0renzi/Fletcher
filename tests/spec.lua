@@ -248,28 +248,55 @@ test("without a quiver or pouch nothing is bought, but the best ammo is still ma
     assert_true(__printed("equip a quiver or ammo pouch to refill."), "the click said nothing")
 end)
 
-test("the bag decides against the weapon, and the mismatch is said once a visit", function()
-    hunter({ bags = { [0] = backpack(), [1] = pouch(2) } })
+test("when a gun is paired with a quiver, nothing is bought and the mismatch is said once a visit", function()
+    hunter({ ranged = GUN, bags = { [0] = backpack(), [1] = quiver(2) } })
+    __open_vendor(arrowVendor())
+    assert_eq(#__buy_log, 0, "bought arrows for a gun")
+    assert_eq(__overlay(4), nil, "arrows marked for a gun")
+    assert_true(button():IsShown(), "button hidden at an arrow vendor on mismatch")
+    assert_true(button().icon.__desaturated, "button not greyed on mismatch")
+    assert_true(__printed("your quiver holds arrows but your gun fires bullets."), "no warning")
+    __merchant_update()
+    assert_eq(__printed_count("holds arrows but your gun"), 1, "warned more than once in a visit")
+    local lines = hover_button()
+    local shown = 0
+    for _, line in ipairs(lines) do
+        if line == "Your quiver holds arrows but your gun fires bullets." then shown = shown + 1 end
+    end
+    assert_eq(shown, 1, "mismatch line count in tooltip: " .. lines_text(lines))
+    click_button()
+    assert_eq(#__buy_log, 0, "a click bought arrows for a gun")
+    assert_eq(__printed_count("holds arrows but your gun"), 2, "a click did not explain")
+
+    -- At a mixed vendor, the gun's best bullet is marked, still without buying.
+    __close_vendor()
     local vendor = arrowVendor()
     for _, entry in ipairs(bulletVendor()) do vendor[#vendor + 1] = entry end
     __open_vendor(vendor)
-    assert_eq(__buy_log[1].id, SOLID, "did not follow the pouch")
+    assert_eq(#__buy_log, 0, "bought on mismatch at a mixed vendor")
+    assert_eq(__overlay(4), nil, "arrows marked at a mixed vendor")
+    assert_true(__overlay(8), "the gun's best bullet not marked")
+    assert_eq(__printed_count("holds arrows but your gun"), 3, "not warned on the next visit")
+end)
+
+test("when a bow is paired with an ammo pouch, nothing is bought and the bow's best arrow is marked", function()
+    hunter({ ranged = BOW, bags = { [0] = backpack(), [1] = pouch(2) } })
+    local vendor = arrowVendor()
+    for _, entry in ipairs(bulletVendor()) do vendor[#vendor + 1] = entry end
+    __open_vendor(vendor)
+    assert_eq(#__buy_log, 0, "bought bullets for a bow")
+    assert_true(__overlay(4), "the bow's best arrow not marked")
+    assert_eq(__overlay(8), nil, "bullets marked for a bow")
     assert_true(__printed("your ammo pouch holds bullets but your bow fires arrows."), "no warning")
-    __deliver_all()
-    __merchant_update()
-    assert_eq(__printed_count("holds bullets but your bow"), 1, "warned more than once in a visit")
     local lines = hover_button()
     assert_true(has_line(lines, "Your ammo pouch holds bullets but your bow fires arrows."), lines_text(lines))
-
-    __close_vendor()
-    __open_vendor(vendor)
-    assert_eq(__printed_count("holds bullets but your bow"), 2, "not warned on the next visit")
 end)
 
 test("the mismatch is not mentioned at a vendor without ammo", function()
     hunter({ bags = { [0] = backpack(), [1] = pouch(2) } })
     __open_vendor({ { id = WATER, price = 25, batch = 1 } })
     assert_false(__printed("holds bullets"), "warned at a water vendor")
+    assert_false(button():IsShown(), "button shown at a water vendor on mismatch")
 end)
 
 test("with a quiver and a pouch, the one the weapon fills wins", function()
@@ -443,7 +470,7 @@ test("the warning and popup come one level before a tier, and not before that", 
 end)
 
 test("the warning and popup follow the bag: bullets too", function()
-    hunter({ level = 24, bags = { [0] = backpack(), [1] = pouch(4) } })
+    hunter({ level = 24, ranged = GUN, bags = { [0] = backpack(), [1] = pouch(4) } })
     __open_vendor(bulletVendor())
     assert_eq(#__buy_log, 0, "bought before confirmation")
     assert_true(__printed("next level unlocks Solid Shot, the better bullet sold here."), "no warning")
@@ -452,6 +479,17 @@ test("the warning and popup follow the bag: bullets too", function()
         "Next level unlocks Solid Shot, the better bullet sold here.\n\nBuy 800 Heavy Shot for 2s anyway?")
     __script(popup().buy, "OnClick")
     assert_eq(__buy_log[1].id, HEAVY, "not the bullets of today")
+end)
+
+test("on a mismatch one level before a tier, no popup is shown and the tooltip names the weapon's ammo", function()
+    hunter({ level = 24, ranged = GUN, bags = { [0] = backpack(), [1] = quiver(4) } })
+    __open_vendor(bulletVendor())
+    assert_eq(#__buy_log, 0, "bought on mismatch")
+    assert_eq(popup(), nil, "popup shown on mismatch")
+    assert_false(__printed("next level unlocks"), "next tier printed in chat on mismatch")
+    local lines = hover_button()
+    assert_true(has_line(lines, "Next level unlocks Solid Shot, the better bullet sold here."), lines_text(lines))
+    assert_true(has_line(lines, "Your quiver holds arrows but your gun fires bullets."), lines_text(lines))
 end)
 
 test("the warning is said once per visit", function()

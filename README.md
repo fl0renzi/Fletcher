@@ -12,10 +12,11 @@ Fletcher: bought 1400 Razor Arrow for 7s. Quiver full (10 / 10 slots).
 
 ## What it buys
 
-- **Which kind**: the bag decides. A quiver gets arrows, an ammo pouch gets bullets. If your ranged
-  weapon fires the other kind, Fletcher still follows the bag and says so once per vendor visit.
-  With no quiver or ammo pouch equipped nothing is bought, though the best ammo for your weapon is
-  still marked.
+- **Which kind**: a quiver holds arrows, an ammo pouch holds bullets. If your ranged weapon fires the
+  other kind (for example, a gun with a quiver equipped), Fletcher buys nothing and says so once per
+  vendor visit, while still marking the best ammo for your weapon. With one of each bag equipped, the
+  one matching your weapon is refilled. With no quiver or ammo pouch equipped nothing is bought,
+  though the best ammo for your weapon is still marked.
 - **Which ammo**: the best of what the vendor sells that you can use right now: the highest required
   level at or below yours, then the highest item level, then the cheapest single round. Only ammo
   sold for gold counts, and nothing sold out. Fletcher ranks whatever the vendor has, so special or

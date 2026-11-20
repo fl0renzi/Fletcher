@@ -256,11 +256,17 @@ local function ShowTooltip(owner)
             GameTooltip:AddLine(API.LeftOutText(scan.leftOut, scan.limit), 1, 1, 1, true)
         end
     elseif scan.message then
-        GameTooltip:AddLine(scan.message, 1, 1, 1, true)
+        if scan.status == "mismatch" then
+            GameTooltip:AddLine(scan.message, LABEL_COLOR[1], LABEL_COLOR[2], LABEL_COLOR[3], true)
+        else
+            GameTooltip:AddLine(scan.message, 1, 1, 1, true)
+        end
     end
 
     local mismatch = API.MismatchLine()
-    if mismatch then GameTooltip:AddLine(mismatch, LABEL_COLOR[1], LABEL_COLOR[2], LABEL_COLOR[3], true) end
+    if mismatch and scan.status ~= "mismatch" then
+        GameTooltip:AddLine(mismatch, LABEL_COLOR[1], LABEL_COLOR[2], LABEL_COLOR[3], true)
+    end
 
     local page = BestPage()
     if page and OnVendorTab() and page ~= MerchantFrame.page then
@@ -282,12 +288,13 @@ local function RefreshTooltip()
     end
 end
 
--- The button shows while the vendor sells ammo the quiver takes. Without a
--- quiver it shows at any ammo vendor, to say why nothing is bought.
+-- The button shows while the vendor sells ammo that fits. Without a quiver,
+-- or when the quiver and weapon disagree, it shows at any ammo vendor, to
+-- say why nothing is bought.
 local function ButtonWanted()
     if not (API.GetDB().showButton and scan.open) then return false end
     if scan.best or (scan.loading and scan.sellsAmmo) then return true end
-    return not scan.kind and scan.sellsAmmo
+    return (not scan.kind or scan.status == "mismatch") and scan.sellsAmmo
 end
 
 local function UpdateButton()
